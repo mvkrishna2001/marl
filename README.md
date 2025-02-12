@@ -1,0 +1,1 @@
+To start the maze solver in maze.py, please press the SPACE bar. 
