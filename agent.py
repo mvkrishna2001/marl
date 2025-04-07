@@ -1,19 +1,31 @@
 import pygame
 
-from solver import a_star
+from solver import *
 from config import CELL_SIZE
 
 class Agent:
-    def __init__(self, name, start, goal, color, maze, start_color, goal_color):
+    def __init__(self, name, start, goal, color, maze, start_color, goal_color, algorithm='a_star'):
         self.name = name
         self.start = start
         self.goal = goal
         self.color = color
-        self.path = a_star(start, goal, maze)
-        self.path_index = 0
-        self.visited = set()
+        self.algorithm = algorithm
         self.start_color = start_color
         self.goal_color = goal_color
+        self.path = self.choose_algorithm(start, goal, maze)
+        self.path_index = 0
+        self.visited = set()
+
+    def choose_algorithm(self, start, goal, maze):
+        if self.algorithm == 'bfs':
+            return bfs(start, goal, maze)
+        elif self.algorithm == 'dfs':
+            return dfs(start, goal, maze)
+        elif self.algorithm == 'dijkstra':
+            return dijkstra(start, goal, maze)
+        else: #default algorithm is A*
+            return a_star(start, goal, maze)
+
 
     def move(self):
         if self.path_index < len(self.path):

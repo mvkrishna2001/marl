@@ -1,4 +1,6 @@
 import pygame
+import argparse
+
 from config import *
 from maze import generate_maze, find_nearest_open_space
 from agent import Agent
@@ -11,16 +13,25 @@ solving = False  # ← flag to control solving start
 
 maze = generate_maze(ROWS, COLS)
 
+# Command-line argument parsing
+def parse_args():
+    parser = argparse.ArgumentParser(description="Choose the maze solver algorithm.")
+    parser.add_argument('--algorithm', type=str, choices=['a_star', 'bfs', 'dfs', 'dijkstra'], default='a_star',
+                        help="The algorithm to use for solving the maze.")
+    return parser.parse_args()
+
+args = parse_args()
+
 # Define agent configs with start/goal colors
 # config: name, start, goal, color, maze, start_color, goal_color
 agent_configs = [
-    ("A", (0, 0), (COLS-1, ROWS-1), (0, 0, 255), (0, 255, 255), (255, 0, 255)),
+    ("A", (0, 0), (COLS-1, ROWS-1), (0, 0, 255), (0, 255, 255), (255, 0, 255), args.algorithm),
     # ("B", (0, ROWS-1), (COLS-1, 0), (255, 0, 0), (255, 255, 0), (255, 100, 100)),
     # ("C", (COLS//2, 0), (COLS//2, ROWS-1), (0, 255, 0), (0, 100, 0), (100, 255, 100)),
 ]
 
 agents = []
-for name, s_coord, g_coord, color, start_color, goal_color in agent_configs:
+for name, s_coord, g_coord, color, start_color, goal_color, algorithm in agent_configs:
     start = find_nearest_open_space(maze, *s_coord)
     goal = find_nearest_open_space(maze, *g_coord)
     agents.append(Agent(name, start, goal, color, maze, start_color, goal_color))
