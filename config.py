@@ -1,0 +1,7 @@
+# Screen settings
+WIDTH, HEIGHT = 600, 600
+CELL_SIZE = 20
+ROWS, COLS = HEIGHT // CELL_SIZE, WIDTH // CELL_SIZE
+
+# Colors
+WHITE, BLACK, GREEN, RED, BLUE = (255, 255, 255), (0, 0, 0), (0, 255, 0), (255, 0, 0), (0, 0, 255)
