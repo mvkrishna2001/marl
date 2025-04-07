@@ -24,3 +24,16 @@ Use the following command to run the maze solver interface:
 python main.py
 ```
 To start the maze solver, press the SPACE bar. 
+
+
+
+## File Structure 
+```
+marl/
+│
+├── main.py               # Entry point: sets up Pygame and runs the loop 
+├── maze.py               # Maze generation and utility functions 
+├── agent.py              # Agent class (pathfinding, movement, drawing)
+├── solver.py             # A* algorithm implementation
+└── config.py             # Settings like colors, cell size, rows, cols, etc.
+```
