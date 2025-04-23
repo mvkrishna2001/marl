@@ -1,9 +1,9 @@
 ## Installation 
 
-1. Create a Conda env that contains Python 3.8
+1. Create a Conda env that contains Python 3.10
 
 ```angular2html
-conda create -n marl_venv python=3.8
+conda create -n marl_venv python=3.10
 ```
 
 2. Active the env
@@ -16,6 +16,10 @@ source activate marl_venv
 pip install -r requirements.txt
 ```
 
+4. Install ffmpeg for maze visualizations 
+```angular2html
+sudo apt install ffmpeg
+```
 
 ## Running the Maze
 
@@ -43,3 +47,7 @@ marl/
 ├── solver.py             # Algorithm implementations
 └── config.py             # Settings like colors, cell size, rows, cols, etc.
 ```
+
+
+## Notes 
+The gym maze environment code is taken from https://github.com/rpinsler/gym-maze/tree/master, with minor modifications. 
