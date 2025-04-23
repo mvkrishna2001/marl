@@ -23,9 +23,15 @@ Use the following command to run the maze solver interface:
 ```angular2html
 python main.py
 ```
-To start the maze solver, press the SPACE bar. 
+To start the maze solver, press the SPACE bar.
 
+### Arguments 
+To run the solver with a specific algorithm, append `--algorithm <algorithm>`. Choices include `['a_star', 'bfs', 'dfs', 'dijkstra']`. 
 
+Example of use:
+```angular2html
+python main.py --algorithm a_star
+```
 
 ## File Structure 
 ```
@@ -34,6 +40,6 @@ marl/
 ├── main.py               # Entry point: sets up Pygame and runs the loop 
 ├── maze.py               # Maze generation and utility functions 
 ├── agent.py              # Agent class (pathfinding, movement, drawing)
-├── solver.py             # A* algorithm implementation
+├── solver.py             # Algorithm implementations
 └── config.py             # Settings like colors, cell size, rows, cols, etc.
 ```
