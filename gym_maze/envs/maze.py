@@ -13,6 +13,8 @@ import rlkit.torch.pytorch_util as ptu
 import torch
 import os 
 
+''' Adapted from https://github.com/rpinsler/gym-maze/tree/master''' 
+
 class MazeEnv(gym.Env):
     """Configurable environment for maze. """
     metadata = {'render.modes': ['human', 'rgb_array']}

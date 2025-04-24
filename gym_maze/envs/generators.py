@@ -5,6 +5,7 @@ from itertools import product as cartesian_product
 
 # from skimage.draw import circle, circle_perimeter
 
+''' Adapted from https://github.com/rpinsler/gym-maze/tree/master'''
 
 class MazeGenerator(object):
     def __init__(self):
