@@ -6,10 +6,9 @@ import matplotlib.animation as animation
 from matplotlib import colors
 from past.utils import old_div
 
-import gym
-from gym import spaces
-from gym.utils import seeding
-import rlkit.torch.pytorch_util as ptu
+import gymnasium as gym
+from gymnasium import spaces
+from gymnasium.utils import seeding
 import torch
 import os 
 
@@ -110,14 +109,17 @@ class MazeEnv(gym.Env):
         # Additional info
         info = {}
 
-        return self._get_obs(), reward, done, info
+        return self._get_obs(), reward, done, False, info
 
     def seed(self, seed=None):
         self.np_random, seed = seeding.np_random(seed)
-
         return [seed]
 
-    def reset(self):
+    def reset(self, seed=None, options=None):
+        # Set seed if provided
+        if seed is not None:
+            self.seed(seed)
+
         # Reset maze
         self.maze = np.array(self.maze_generator.get_maze())
 
@@ -129,7 +131,7 @@ class MazeEnv(gym.Env):
         # Clean the traces of the trajectory
         self.traces = [self.init_state]
 
-        return self._get_obs()
+        return self._get_obs(), {}
 
     def render(self, mode='human', close=False):
         if close:
@@ -330,10 +332,10 @@ class MazeEnv(gym.Env):
                     for goal in self.goal_states: _obs[goal[0], goal[1]] = self.GOAL
                     _obs[r, c] = self.AGENT
                     act, _ = policy.get_action(_obs.reshape(1, -1))
-                    Qs = [qf(ptu.Variable(ptu.from_numpy(_obs).view(1, -1)),
-                             ptu.Variable(a.view(1, -1)))
-                          for a in ptu.eye(self.num_actions)]
-                    V[r, c] = ptu.get_numpy(torch.max(torch.cat(Qs)))
+                    Qs = [qf(torch.from_numpy(_obs).view(1, -1),
+                             torch.from_numpy(a).view(1, -1))
+                          for a in torch.eye(self.num_actions)]
+                    V[r, c] = torch.max(torch.cat(Qs)).item()
                     Mask[c, r, :] = False
                     arrowColors[c, r, act] = 1
                     arrowSize[c, r, :] = policy.get_actions(obs.reshape(1, -1))
