@@ -1,4 +1,4 @@
-## Installation 
+## Installation
 
 1. Create a Conda env that contains Python 3.10
 
@@ -11,43 +11,50 @@ conda create -n marl_venv python=3.10
 source activate marl_venv
 ```
 
-3. Install the requirements 
+3. Install the requirements
 ```angular2html
 pip install -r requirements.txt
 ```
 
-4. Install ffmpeg for maze visualizations 
+4. Install ffmpeg for maze visualizations
 ```angular2html
 sudo apt install ffmpeg
 ```
 
 ## Running the Maze
 
-Use the following command to run the maze solver interface: 
+Use the following command to run the maze solver interface:
 ```angular2html
-python main.py
+python maze_solver.py
 ```
-To start the maze solver, press the SPACE bar.
 
-### Arguments 
-To run the solver with a specific algorithm, append `--algorithm <algorithm>`. Choices include `['a_star', 'bfs', 'dfs', 'dijkstra']`. 
+### Arguments
+* `--alg`. Choices :`['astar', 'bfs', 'dfs', 'dijkstra']`
+* `--gif`. This specifies the path to output GIF file
+* `--maze`. Choices: `["simple", "random", "block", "u", "t"]`. This gives the choice between a simple empty maze, a random block maze, a random maze, a U-maze, or a multiple T-maze. The specific parameters of each maze can be modified in the `maze_solver.py` file.
 
 Example of use:
 ```angular2html
-python main.py --algorithm a_star
+python maze_solver.py --alg astar --maze block  --gif data/block_maze.gif
 ```
 
-## File Structure 
+## File Structure
 ```
 marl/
-│
-├── main.py               # Entry point: sets up Pygame and runs the loop 
-├── maze.py               # Maze generation and utility functions 
-├── agent.py              # Agent class (pathfinding, movement, drawing)
-├── solver.py             # Algorithm implementations
-└── config.py             # Settings like colors, cell size, rows, cols, etc.
+├── data/                        # GIF outputs of maze_solver
+├── gym_maze/
+│   └── envs/
+│       ├── generators.py        # Maze generator definitions
+│       ├── maze.py              # Gym maze environment configuration
+│       ├── node.py              # Node class shared by algorithms
+│       └── algorithms/
+│           ├── a_star.py
+│           ├── bfs.py
+│           ├── dfs.py
+│           └── dijkstra.py
+
 ```
 
 
-## Notes 
+## Notes
 The gym maze environment code is taken from https://github.com/rpinsler/gym-maze/tree/master, with minor modifications. 
