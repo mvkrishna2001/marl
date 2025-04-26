@@ -33,7 +33,12 @@ class MazeEnv(gym.Env):
         self.maze_generator = maze_generator
         self.maze = np.array(self.maze_generator.get_maze())
         self.maze_size = self.maze.shape
-        self.init_state, self.goal_states = self.maze_generator.sample_state()
+        # self.init_state, self.goal_states = self.maze_generator.sample_state()
+        self.init_states = None  # Will be set in reset()
+        self.goal_states = None  # Will be set in reset()
+        
+        # Initialize goal reached status for each agent
+        self.goal_reached = []  # Will be set in reset()
 
         self.render_trace = render_trace
         self.traces = []
@@ -49,8 +54,7 @@ class MazeEnv(gym.Env):
         # than storing the frames and creating an animation at the end
         self.live_display = live_display
 
-        self.state = None
-
+        self.states = None   # Will be set in reset()
         # Action space: 0: Up, 1: Down, 2: Left, 3: Right
         if self.action_type == 'VonNeumann':  # Von Neumann neighborhood
             self.num_actions = 4
@@ -82,6 +86,7 @@ class MazeEnv(gym.Env):
 
         # Colormap: order of color is, free space, wall, agent, food, poison
         self.cmap = colors.ListedColormap(['white', 'black', 'blue', 'green', 'red', 'gray'])
+
         self.bounds = [0, 1, 2, 3, 4, 5, 6]  # values for each color
         self.norm = colors.BoundaryNorm(self.bounds, self.cmap.N)
 
@@ -92,40 +97,54 @@ class MazeEnv(gym.Env):
         self.AGENT = 2
         self.GOAL = 3
 
-    def step(self, action):
-        old_state = self.state
-        # Update current state
-        self.state = self._next_state(self.state, action)
+    def step(self, actions):
+        rewards = []
+        dones = []
+        infos = []
+        new_states = []
 
-        # Track visited cells
-        self.visited_cells.add(tuple(self.state))
+        for i, action in enumerate(actions):
+            if self.goal_reached[i]:
+                # Agent already reached goal, no movement
+                new_states.append(self.states[i])
+                rewards.append(0)
+                dones.append(True)
+                infos.append({})
+                continue
+            
+            old_state = self.states[i]
+            new_state = self._next_state(old_state, action)
+            self.traces[i].append(new_state)
+            new_states.append(new_state)
 
-        # Footprint: Record agent trajectory
-        self.traces.append(self.state)
-
-        if self._goal_test(self.state):  # Goal check
-            reward = +1 * self.maze.size
-            done = True
-        elif self.state == old_state:  # Hit wall
-            reward = -1
-            done = False
-        else:  # Moved, small negative reward to encourage shorest path
-            reward = -0.01 * self.num_actions
-            done = False
+            if self._goal_test(new_state, self.goal_states[i]):
+                self.goal_reached[i] = True
+                reward = +1
+                done = True
+            elif new_state == old_state:
+                reward = -1
+                done = False
+            else:
+                reward = -0.01
+                done = False
 
         # Calculate exploration percentage
         exploration_percentage = (len(self.visited_cells) / self.total_free_cells) * 100
 
         # Additional info
         info = {'exploration_percentage': exploration_percentage}
+        rewards.append(reward)
+        dones.append(done)
+        infos.append({})  # Customize if needed
 
-        return self._get_obs(), reward, done, False, info
+        self.states = new_states
+        return [self._get_obs(i) for i in range(len(self.states))], rewards, dones, False, infos
 
     def seed(self, seed=None):
         self.np_random, seed = seeding.np_random(seed)
         return [seed]
 
-    def reset(self, seed=None, options=None):
+    def reset(self, num_agents=1, seed=None, options=None):
         # Set seed if provided
         if seed is not None:
             self.seed(seed)
@@ -133,6 +152,17 @@ class MazeEnv(gym.Env):
         # Reset maze
         self.maze = np.array(self.maze_generator.get_maze())
 
+        # Sample initial and goal states for each agent
+        self.init_states, self.goal_states = self.maze_generator.sample_multi_agent_states(num_agents=num_agents)
+
+        # Set the current position of each agent
+        self.states = self.init_states.copy()
+        
+        # Initialize goal reached status for each agent
+        self.goal_reached = [False] * len(self.states)  # Reset goal status for each agent
+
+        # Initialize traces and video frames
+        self.traces = [[s] for s in self.init_states]  # One trace per agent
         # Set current state be initial state
         self.state = self.init_state
 
@@ -143,10 +173,9 @@ class MazeEnv(gym.Env):
 
         # Clean the list of ax_imgs, the buffer for generating videos
         self.ax_imgs = []
-        # Clean the traces of the trajectory
-        self.traces = [self.init_state]
 
-        return self._get_obs(), {}
+        # Return initial observations for each agent
+        return [self._get_obs(i) for i in range(len(self.states))]
 
     def render(self, mode='human', close=False):
         if close:
@@ -154,34 +183,36 @@ class MazeEnv(gym.Env):
             return
 
         obs = self._get_full_obs()
-        partial_obs = self._get_partial_obs(self.pob_size)
+        # partial_obs = [self._get_partial_obs(self.pob_size, pos=self.states[i]) for i in range(len(self.states))]
 
         # For rendering traces: Only for visualization, does not affect the observation data
         if self.render_trace:
-            # obs[list(zip(*self.traces[:-1]))] = self.VISITED
-            for y, x in self.traces[:-1]:
-                obs[y, x] = self.VISITED
+            # Iterate through each agent's trace and mark their path on the maze (observation)
+            for i, trace in enumerate(self.traces):  # Loop through each agent's trace
+                for y, x in trace[:-1]:  # Skip the last position to avoid re-rendering the final position
+                    obs[y, x] = self.VISITED  # Mark the agent's path as visited
 
         # Create Figure for rendering
         if not hasattr(self, 'fig'):  # initialize figure and plotting axes
-            self.fig, (self.ax_full, self.ax_partial) = plt.subplots(nrows=1, ncols=2)
+            # self.fig, (self.ax_full, self.ax_partial) = plt.subplots(nrows=1, ncols=2)
+            self.fig, self.ax_full = plt.subplots()
         self.ax_full.axis('off')
-        self.ax_partial.axis('off')
+        # self.ax_partial.axis('off')
 
         self.fig.show()
         if self.live_display:
             # Only create the image the first time
             if not hasattr(self, 'ax_full_img'):
                 self.ax_full_img = self.ax_full.imshow(obs, cmap=self.cmap, norm=self.norm, animated=True)
-            if not hasattr(self, 'ax_partial_img'):
-                self.ax_partial_img = self.ax_partial.imshow(partial_obs, cmap=self.cmap, norm=self.norm, animated=True)
+            # if not hasattr(self, 'ax_partial_img'):
+            #     self.ax_partial_img = self.ax_partial.imshow(partial_obs, cmap=self.cmap, norm=self.norm, animated=True)
             # Update the image data for efficient live video
             self.ax_full_img.set_data(obs)
-            self.ax_partial_img.set_data(partial_obs)
+            # self.ax_partial_img.set_data(partial_obs)
         else:
             # Create a new image each time to allow an animation to be created
             self.ax_full_img = self.ax_full.imshow(obs, cmap=self.cmap, norm=self.norm, animated=True)
-            self.ax_partial_img = self.ax_partial.imshow(partial_obs, cmap=self.cmap, norm=self.norm, animated=True)
+            # self.ax_partial_img = self.ax_partial.imshow(partial_obs, cmap=self.cmap, norm=self.norm, animated=True)
 
         plt.draw()
 
@@ -190,19 +221,17 @@ class MazeEnv(gym.Env):
             self.fig.canvas.draw()
         else:
             # Put in AxesImage buffer for video generation
-            self.ax_imgs.append([self.ax_full_img, self.ax_partial_img])  # List of axes to update figure frame
+            # self.ax_imgs.append([self.ax_full_img, self.ax_partial_img])  # List of axes to update figure frame
+            self.ax_imgs.append([self.ax_full_img])  # Adjusted to avoid partial image
 
             self.fig.set_dpi(100)
 
         plt.pause(.1)
         return self.fig
 
-    def _goal_test(self, state):
+    def _goal_test(self, state, goal):
         """Return True if current state is a goal state."""
-        if type(self.goal_states[0]) == list:
-            return list(state) in self.goal_states
-        elif type(self.goal_states[0]) == tuple:
-            return tuple(state) in self.goal_states
+        return tuple(state) == tuple(goal)
 
     def _next_state(self, state, action):
         """Return the next state from a given state by taking a given action."""
@@ -220,30 +249,36 @@ class MazeEnv(gym.Env):
         else:  # Valid move for 0, 2, 3, 4
             return new_state
 
-    def _get_obs(self):
+    def _get_obs(self, agent_idx):
+        state = self.states[agent_idx]
         if self.obs_type == 'full':
-            return self._get_full_obs().flatten()
+            return self._get_full_obs().flatten()  # same for all agents
         elif self.obs_type == 'partial':
-            return self._get_partial_obs(self.pob_size).flatten()
+            return self._get_partial_obs(self.pob_size, state).flatten()
 
     def _get_full_obs(self):
-        """Return a 2D array representation of maze."""
+        """Return a 2D array representation of maze with all agents and goals."""
         obs = np.array(self.maze)
-        # Set goal positions
-        for goal in self.goal_states:
-            obs[goal[0]][goal[1]] = 3  # 3: goal
+        # The colours for the goal and end positions are the same 
+        # Set goal positions with unique values per agent
+        for i, goal in enumerate(self.goal_states):
+            obs[goal[0]][goal[1]] = 2 + i  
 
-        # Set current position
-        # Come after painting goal positions, avoid invisible within multi-goal regions
-        obs[self.state[0]][self.state[1]] = 2  # 2: agent
+        # Set agent positions (after goals, to avoid hiding agents under goals)
+        for i, state in enumerate(self.states):
+            obs[state[0]][state[1]] = 2 + i 
 
         return obs
 
-    def _get_partial_obs(self, size=1):
+    def _get_partial_obs(self, size=1, pos=None):
         """Get partial observable window according to Moore neighborhood"""
         # Get maze with indicated location of current position and goal positions
+        if pos is None:
+            raise ValueError("Agent position must be provided for partial observation.")
+
+        # Get full maze with current agent and goal markings
         maze = self._get_full_obs()
-        pos = np.array(self.state)
+        pos = np.array(pos)
 
         under_offset = np.min(pos - size)
         over_offset = np.min(len(maze) - (pos + size + 1))
@@ -255,7 +290,7 @@ class MazeEnv(gym.Env):
 
         return maze[pos[0] - size: pos[0] + size + 1, pos[1] - size: pos[1] + size + 1]
 
-    def _get_video(self, interval=200, gif_path=None):
+    def _get_video(self, interval=400, gif_path=None):
         if self.live_display:
             # TODO: Find a way to create animations without slowing down the live display
             print('Warning: Generating an Animation when live_display=True not yet supported.')
@@ -263,7 +298,7 @@ class MazeEnv(gym.Env):
 
         if gif_path is not None:
             os.makedirs(os.path.dirname(gif_path), exist_ok=True)
-            anim.save(gif_path, writer='imagemagick', fps=10)
+            anim.save(gif_path, writer='pillow')
         return anim
 
     def render_learning(self, policy, qf, vmin, vmax):
@@ -401,7 +436,3 @@ class SparseMazeEnv(MazeEnv):
             reward = 0
 
         return obs, reward, done, info
-
-##########################################
-# TODO: Make Partial observable envs as OOP-style
-###########################################

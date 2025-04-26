@@ -55,10 +55,11 @@ class Frontier(object):
     
 class AstarSolver(object):
     """A* solver for the maze"""
-    def __init__(self, env, goal):
+    def __init__(self, env, goal, start_state):
         self.env = env
         self.goal = goal
-        
+        self.start_state = start_state
+
         # Solve it
         self.solution_node = self._astar_search(self._heuristic)
     
@@ -93,7 +94,7 @@ class AstarSolver(object):
             h: A heuristic function
         """
         f = lambda node: node.path_cost + h(node.state)
-        frontier = Frontier(Node(self.env.state), f)
+        frontier = Frontier(Node(self.start_state), f)
         explored = set()
 
         while frontier:

@@ -1,5 +1,6 @@
 import numpy as np
 from numpy.random import randint
+import random 
 
 from itertools import product as cartesian_product
 
@@ -28,6 +29,17 @@ class MazeGenerator(object):
         
     def get_maze(self):
         return self.maze
+    
+    def sample_multi_agent_states(self, num_agents=2):
+        """Sample unique initial and goal states for multiple agents."""
+        free_cells = list(zip(*np.where(self.maze == 0)))  # all free positions
+
+        # Randomly sample 2 * num_agents distinct positions
+        sampled = random.sample(free_cells, 2 * num_agents)
+        init_states = sampled[:num_agents]
+        goal_states = sampled[num_agents:]
+
+        return init_states, goal_states
 
 
 class SimpleMazeGenerator(MazeGenerator):
