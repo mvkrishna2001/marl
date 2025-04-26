@@ -114,18 +114,21 @@ class MazeEnv(gym.Env):
             
             old_state = self.states[i]
             new_state = self._next_state(old_state, action)
+
+        # Track visited cells
+        self.visited_cells.add(tuple(self.state))
             self.traces[i].append(new_state)
             new_states.append(new_state)
 
             if self._goal_test(new_state, self.goal_states[i]):
                 self.goal_reached[i] = True
-                reward = +1
+                reward = +1 * self.maze.size
                 done = True
             elif new_state == old_state:
                 reward = -1
                 done = False
             else:
-                reward = -0.01
+                reward = -0.01 * self.num_actions
                 done = False
 
         # Calculate exploration percentage
