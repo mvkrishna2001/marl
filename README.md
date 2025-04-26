@@ -30,12 +30,14 @@ python maze_solver.py
 
 ### Arguments
 * `--alg`. Choices :`['astar', 'bfs', 'dfs', 'dijkstra']`
-* `--gif`. This specifies the path to output GIF file
 * `--maze`. Choices: `["simple", "random", "block", "u", "t"]`. This gives the choice between a simple empty maze, a random block maze, a random maze, a U-maze, or a multiple T-maze. The specific parameters of each maze can be modified in the `maze_solver.py` file.
+* `--num_agents`. An integer that specified the number of agents in the maze. We tested with [1, 2, 3]. 
+* `--gif`. This specifies the path to output GIF file
+
 
 Example of use:
 ```angular2html
-python maze_solver.py --alg astar --maze block  --gif data/block_maze.gif
+python maze_solver.py --alg astar --maze block --num_agents 2 --gif data/block_maze.gif
 ```
 
 ## File Structure
