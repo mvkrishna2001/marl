@@ -41,6 +41,10 @@ class MazeEnv(gym.Env):
         self.action_type = action_type
         self.obs_type = obs_type
 
+        # Track explored cells
+        self.visited_cells = set()
+        self.total_free_cells = np.sum(self.maze == 0)  # Count free cells (non-walls)
+        
         # If True, show the updated display each time render is called rather
         # than storing the frames and creating an animation at the end
         self.live_display = live_display
@@ -93,21 +97,27 @@ class MazeEnv(gym.Env):
         # Update current state
         self.state = self._next_state(self.state, action)
 
+        # Track visited cells
+        self.visited_cells.add(tuple(self.state))
+
         # Footprint: Record agent trajectory
         self.traces.append(self.state)
 
         if self._goal_test(self.state):  # Goal check
-            reward = +1
+            reward = +1 * self.maze.size
             done = True
         elif self.state == old_state:  # Hit wall
             reward = -1
             done = False
         else:  # Moved, small negative reward to encourage shorest path
-            reward = -0.01
+            reward = -0.01 * self.num_actions
             done = False
 
+        # Calculate exploration percentage
+        exploration_percentage = (len(self.visited_cells) / self.total_free_cells) * 100
+
         # Additional info
-        info = {}
+        info = {'exploration_percentage': exploration_percentage}
 
         return self._get_obs(), reward, done, False, info
 
@@ -125,6 +135,11 @@ class MazeEnv(gym.Env):
 
         # Set current state be initial state
         self.state = self.init_state
+
+        # Reset visited cells tracking
+        self.visited_cells = set()
+        self.visited_cells.add(tuple(self.state))
+        self.total_free_cells = np.sum(self.maze == 0)
 
         # Clean the list of ax_imgs, the buffer for generating videos
         self.ax_imgs = []

@@ -7,6 +7,7 @@ from distutils.util import strtobool
 import copy
 from tqdm import tqdm
 import logging
+import json
 
 import gymnasium as gym
 import numpy as np
@@ -48,7 +49,7 @@ class QNetwork(DeterministicMixin, Model):
             param.requires_grad = False
     
     def compute(self, inputs, role="q_network"):
-        states = inputs["states"]
+        states = inputs["states"].float()  # Ensure float32 dtype
         if role == "target_q_network":
             return self.target_layers(states), {}
         return self.layers(states), {}
@@ -76,13 +77,15 @@ def parse_args():
                         help="The entity (team) of wandb's project")
     parser.add_argument("--capture-video", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
                         help="Whether to capture videos of the agent performances")
+    parser.add_argument("--log-dir", type=str, default="logs",
+                        help="Directory where logs and results will be stored")
     
     # Algorithm specific arguments
     parser.add_argument("--total-timesteps", type=int, default=100000,
                         help="Total timesteps of the experiments")
     parser.add_argument("--learning-rate", type=float, default=2.5e-4,
                         help="Learning rate of the optimizer")
-    parser.add_argument("--buffer-size", type=int, default=10000,
+    parser.add_argument("--buffer-size", type=int, default=10000000,
                         help="Size of the replay buffer")
     parser.add_argument("--gamma", type=float, default=0.99,
                         help="Discount factor gamma")
@@ -115,10 +118,11 @@ def parse_args():
 
 def make_env(args):
     from gym_maze.envs import MazeEnv
-    from gym_maze.envs.generators import RandomMazeGenerator
+    from gym_maze.envs.generators import RandomMazeGenerator, RandomBlockMazeGenerator
     
     # Create maze generator
-    maze_generator = RandomMazeGenerator(args.maze_size, args.maze_size)
+    # maze_generator = RandomMazeGenerator(args.maze_size, args.maze_size)
+    maze_generator = RandomBlockMazeGenerator(args.maze_size, obstacle_ratio=0.1)  # Use 10% obstacle ratio
     
     # Create maze environment
     env = MazeEnv(
@@ -138,11 +142,15 @@ def make_env(args):
 
 def train_dqn(args):
     # Set up logging
+    run_name = f"{args.exp_name}_{args.seed}_{int(time.time())}"
+    log_dir = os.path.join(args.log_dir, run_name)
+    os.makedirs(log_dir, exist_ok=True)
+    
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
         handlers=[
-            logging.FileHandler(f"logs/{args.exp_name}_{args.seed}_{int(time.time())}.log"),
+            logging.FileHandler(os.path.join(log_dir, "train.log")),
             logging.StreamHandler()
         ]
     )
@@ -158,14 +166,19 @@ def train_dqn(args):
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
     logger.info(f"Using device: {device}")
     
-    # Create directories for logging and checkpoints
-    run_name = f"{args.exp_name}_{args.seed}_{int(time.time())}"
-    log_dir = os.path.join("logs", run_name)
+    # Create directories for checkpoints
     checkpoint_dir = os.path.join(log_dir, "checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
     
-    # Create writer for logging
-    writer = SummaryWriter(f"runs/{run_name}")
+    # Save configuration
+    config = vars(args)
+    with open(os.path.join(log_dir, "config.json"), "w") as f:
+        json.dump(config, f, indent=4)
+    
+    # Create writer for logging - ensure only one writer instance
+    if 'writer' in locals():
+        writer.close()
+    writer = SummaryWriter(log_dir)
     
     # Create environment
     env = make_env(args)
@@ -174,7 +187,7 @@ def train_dqn(args):
     
     # Extract state dimensions and action space
     if args.observation_type == "full":
-        state_dim = env.maze_size[0] * env.maze_size[1]
+        state_dim = env.unwrapped.maze_size[0] * env.unwrapped.maze_size[1]
         flat_observation = True
     else:  # partial
         state_dim = (args.pob_size * 2 + 1) ** 2
@@ -244,14 +257,17 @@ def train_dqn(args):
     obs, _ = env.reset(seed=args.seed)
     if flat_observation:
         obs = obs.flatten()
+    obs = obs.astype(np.float32)  # Convert observation to float32
     
     # Tracking variables
     global_step = 0
     episode_rewards = []
     episode_lengths = []
+    episode_exploration = []  # Track exploration percentage per episode
     episode_count = 0
     episode_reward = 0
     episode_length = 0
+    episode_explored = 0  # Track exploration for current episode
     
     # Create progress bar
     pbar = tqdm(total=args.total_timesteps, desc="Training")
@@ -265,10 +281,12 @@ def train_dqn(args):
         next_obs, reward, done, truncated, info = env.step(action)
         if flat_observation:
             next_obs = next_obs.flatten()
+        next_obs = next_obs.astype(np.float32)  # Convert next observation to float32
         
         # Update episode statistics
         episode_reward += reward
         episode_length += 1
+        episode_explored = info.get('exploration_percentage', 0)  # Get exploration percentage
         
         # Record transition
         agent.record_transition(
@@ -286,6 +304,20 @@ def train_dqn(args):
         # Update agent
         agent.post_interaction(timestep=global_step, timesteps=args.total_timesteps)
         
+        # Log additional metrics
+        if global_step % 100 == 0:
+            # Log Q-values
+            with torch.no_grad():
+                q_values = online_net.compute({"states": torch.from_numpy(obs).float().unsqueeze(0).to(device)})[0]
+                writer.add_scalar("charts/q_values", q_values.mean().item(), global_step)
+            
+            # Log loss if available from the agent's latest update
+            if hasattr(agent, 'loss'):
+                writer.add_scalar("charts/loss", agent.loss, global_step)
+            
+            # Log exploration percentage
+            writer.add_scalar("charts/exploration_percentage", episode_explored, global_step)
+        
         # Update observation
         obs = next_obs
         
@@ -300,35 +332,45 @@ def train_dqn(args):
             episode_count += 1
             episode_rewards.append(episode_reward)
             episode_lengths.append(episode_length)
+            episode_exploration.append(episode_explored)  # Store final exploration percentage
             
             # Log to tensorboard
             writer.add_scalar("charts/episode_reward", episode_reward, global_step)
             writer.add_scalar("charts/episode_length", episode_length, global_step)
+            writer.add_scalar("charts/episode_exploration", episode_explored, global_step)
+            writer.flush()  # Force write to disk
             
             # Log to console
             if episode_count % 10 == 0:
                 avg_reward = np.mean(episode_rewards[-10:])
                 avg_length = np.mean(episode_lengths[-10:])
-                logger.info(f"Episode {episode_count} - Average Reward (last 10): {avg_reward:.2f}, Average Length: {avg_length:.2f}")
+                avg_exploration = np.mean(episode_exploration[-10:])
+                logger.info(f"Episode {episode_count} - Average Reward (last 10): {avg_reward:.2f}, Average Length: {avg_length:.2f}, Average Exploration: {avg_exploration:.2f}%")
             
             # Reset episode statistics
             episode_reward = 0
             episode_length = 0
+            episode_explored = 0
         
         # Update progress bar
         pbar.update(1)
         pbar.set_postfix({
             "episode": episode_count,
             "reward": episode_reward,
-            "length": episode_length
+            "length": episode_length,
+            "explored": f"{episode_explored:.1f}%"
         })
     
     # Close progress bar
     pbar.close()
     
     # Save final model
-    torch.save(online_net.state_dict(), f"models/{run_name}.pt")
-    logger.info(f"Saved final model to models/{run_name}.pt")
+    torch.save(online_net.state_dict(), f"{log_dir}/final_model_{run_name}.pt")
+    logger.info(f"Saved final model to {log_dir}/final_model_{run_name}.pt")
+    
+    # Close environment and writer
+    env.close()
+    writer.close()
     
     # Log final statistics
     logger.info(f"Training completed after {args.total_timesteps} timesteps")
@@ -336,9 +378,9 @@ def train_dqn(args):
     logger.info(f"Average reward: {np.mean(episode_rewards):.2f} ± {np.std(episode_rewards):.2f}")
     logger.info(f"Average episode length: {np.mean(episode_lengths):.2f} ± {np.std(episode_lengths):.2f}")
     
-    # Close environment and writer
-    env.close()
-    writer.close()
+    # Generate plots after writer is closed
+    from plotting import plot_training_metrics
+    plot_training_metrics(log_dir, save_path=os.path.join(log_dir, "training_metrics.png"))
 
 
 if __name__ == "__main__":
