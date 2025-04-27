@@ -31,14 +31,34 @@ class MazeGenerator(object):
         return self.maze
     
     def sample_multi_agent_states(self, num_agents=2):
-        """Sample unique initial and goal states for multiple agents."""
-        free_cells = list(zip(*np.where(self.maze == 0)))  # all free positions
-
-        # Randomly sample 2 * num_agents distinct positions
-        sampled = random.sample(free_cells, 2 * num_agents)
-        init_states = sampled[:num_agents]
-        goal_states = sampled[num_agents:]
-
+        """
+        Sample unique initial and goal states for multiple agents.
+        
+        Args:
+            num_agents: Number of agents to sample positions for
+            
+        Returns:
+            init_states: List of initial states for each agent [num_agents, 2]
+            goal_states: List of goal states for each agent [num_agents, 2]
+        """
+        # Get all free cells (not walls)
+        free_cells = list(zip(*np.where(self.maze == 0)))
+        
+        # Make sure we have enough free cells for all agents and goals
+        required_cells = 2 * num_agents
+        if len(free_cells) < required_cells:
+            raise ValueError(f"Not enough free cells ({len(free_cells)}) for {num_agents} agents (need {required_cells})")
+        
+        # Randomly sample distinct positions for initial and goal states
+        sampled_indices = random.sample(range(len(free_cells)), required_cells)
+        
+        # Extract the positions and convert to numpy arrays
+        sampled_positions = [np.array(free_cells[i]) for i in sampled_indices]
+        
+        # Split into initial and goal states
+        init_states = sampled_positions[:num_agents]
+        goal_states = sampled_positions[num_agents:]
+        
         return init_states, goal_states
 
 

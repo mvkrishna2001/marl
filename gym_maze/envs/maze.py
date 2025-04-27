@@ -50,6 +50,13 @@ class MazeEnv(gym.Env):
         self.visited_cells = set()
         self.total_free_cells = np.sum(self.maze == 0)  # Count free cells (non-walls)
         
+        # Advanced tracking metrics
+        self.state_visit_counts = {}  # Tracks how many times each state has been visited
+        self.total_revisits = 0       # Total count of revisits to already visited states
+        self.total_steps = 0          # Total steps taken by all agents
+        self.steps_to_solve = 0       # Steps taken until maze is solved
+        self.maze_solved = False      # Flag to indicate if maze has been solved
+        
         # If True, show the updated display each time render is called rather
         # than storing the frames and creating an animation at the end
         self.live_display = live_display
@@ -102,6 +109,11 @@ class MazeEnv(gym.Env):
         dones = []
         infos = []
         new_states = []
+        
+        # Increment total steps
+        self.total_steps += 1
+        if not self.maze_solved:
+            self.steps_to_solve += 1
 
         for i, action in enumerate(actions):
             if self.goal_reached[i]:
@@ -115,13 +127,25 @@ class MazeEnv(gym.Env):
             old_state = self.states[i]
             new_state = self._next_state(old_state, action)
 
-        # Track visited cells
-        self.visited_cells.add(tuple(self.state))
+            # Track visited cells
+            self.visited_cells.add(tuple(new_state))
+            
+            # Update state visit counts
+            pos_tuple = tuple(new_state)
+            if pos_tuple in self.state_visit_counts:
+                self.state_visit_counts[pos_tuple] += 1
+                self.total_revisits += 1
+            else:
+                self.state_visit_counts[pos_tuple] = 1
+                
             self.traces[i].append(new_state)
             new_states.append(new_state)
 
             if self._goal_test(new_state, self.goal_states[i]):
                 self.goal_reached[i] = True
+                # If any agent reaches the goal for the first time, mark maze as solved
+                if not self.maze_solved:
+                    self.maze_solved = True
                 reward = +1 * self.maze.size
                 done = True
             elif new_state == old_state:
@@ -140,8 +164,22 @@ class MazeEnv(gym.Env):
         dones.append(done)
         infos.append({})  # Customize if needed
 
+        # Calculate exploration percentage
+        exploration_percentage = (len(self.visited_cells) / self.total_free_cells) * 100
+
+        # Create unified info dictionary
+        info = {
+            'exploration_percentage': exploration_percentage,
+            'total_revisits': self.total_revisits,
+            'total_steps': self.total_steps,
+            'steps_to_solve': self.steps_to_solve if self.maze_solved else -1,
+            'maze_solved': self.maze_solved,
+            'unique_states_visited': len(self.state_visit_counts),
+            'global_state': self._get_global_state()  # Add global state for QMIX
+        }
+
         self.states = new_states
-        return [self._get_obs(i) for i in range(len(self.states))], rewards, dones, False, infos
+        return [self._get_obs(i) for i in range(len(self.states))], rewards, dones, False, info
 
     def seed(self, seed=None):
         self.np_random, seed = seeding.np_random(seed)
@@ -166,19 +204,53 @@ class MazeEnv(gym.Env):
 
         # Initialize traces and video frames
         self.traces = [[s] for s in self.init_states]  # One trace per agent
-        # Set current state be initial state
-        self.state = self.init_state
 
         # Reset visited cells tracking
         self.visited_cells = set()
-        self.visited_cells.add(tuple(self.state))
+        for state in self.states:
+            self.visited_cells.add(tuple(state))
         self.total_free_cells = np.sum(self.maze == 0)
+        
+        # Reset tracking metrics
+        self.state_visit_counts = {}
+        for pos in self.states:
+            pos_tuple = tuple(pos)
+            self.state_visit_counts[pos_tuple] = 1
+        
+        self.total_revisits = 0
+        self.total_steps = 0
+        self.steps_to_solve = 0
+        self.maze_solved = False
 
         # Clean the list of ax_imgs, the buffer for generating videos
         self.ax_imgs = []
+        
+        # Create info dictionary with metrics
+        info = {
+            'total_revisits': self.total_revisits,
+            'total_steps': self.total_steps,
+            'steps_to_solve': self.steps_to_solve,
+            'maze_solved': self.maze_solved,
+            'unique_states_visited': len(self.state_visit_counts),
+            'global_state': self._get_global_state()  # Add global state for QMIX
+        }
 
         # Return initial observations for each agent
-        return [self._get_obs(i) for i in range(len(self.states))]
+        return [self._get_obs(i) for i in range(len(self.states))], info
+        
+    def _get_global_state(self):
+        """
+        Create a global state representation for QMIX. In this implementation,
+        the global state includes the flattened maze with agent and goal positions.
+        
+        Returns:
+            global_state: Flattened global state (numpy array)
+        """
+        # Get the full observation which includes maze, agents, and goals
+        full_obs = self._get_full_obs()
+        
+        # For QMIX, we need a flat representation
+        return full_obs.flatten().astype(np.float32)
 
     def render(self, mode='human', close=False):
         if close:
