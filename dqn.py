@@ -77,7 +77,7 @@ def parse_args():
                         help="The entity (team) of wandb's project")
     parser.add_argument("--capture-video", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
                         help="Whether to capture videos of the agent performances")
-    parser.add_argument("--log-dir", type=str, default="logs",
+    parser.add_argument("--log-dir", type=str, default="/home/mila/m/munjuluv/scratch/logs/manual_triggers/",
                         help="Directory where logs and results will be stored")
     
     # Algorithm specific arguments
@@ -133,7 +133,7 @@ def make_env(args):
     )
     
     # Wrap environment for compatibility
-    env = gym.wrappers.RecordEpisodeStatistics(env)
+    # env = gym.wrappers.RecordEpisodeStatistics(env)
     if args.capture_video:
         env = gym.wrappers.RecordVideo(env, f"videos/{args.exp_name}")
     
@@ -254,7 +254,8 @@ def train_dqn(args):
     logger.info("Initialized DQN agent")
     
     # Training loop
-    obs, _ = env.reset(seed=args.seed)
+    nested_obs, _ = env.reset(seed=args.seed)
+    obs = nested_obs[0]  # only one agent for DQN impl.
     if flat_observation:
         obs = obs.flatten()
     obs = obs.astype(np.float32)  # Convert observation to float32
@@ -278,7 +279,10 @@ def train_dqn(args):
         action = action.item()  # get scalar value
         
         # Execute action in environment
-        next_obs, reward, done, truncated, info = env.step(action)
+        unflattened_next_obs, unflattened_reward, unflattened_done, truncated, info = env.step([action])    # [action] because env.step() expects a list of actions.
+        next_obs = unflattened_next_obs[0]
+        reward = unflattened_reward[0]
+        done = unflattened_done[0]
         if flat_observation:
             next_obs = next_obs.flatten()
         next_obs = next_obs.astype(np.float32)  # Convert next observation to float32
@@ -324,7 +328,8 @@ def train_dqn(args):
         # Handle episode completion
         if done:
             # Reset environment
-            obs, _ = env.reset()
+            nested_obs, _ = env.reset(seed=args.seed)
+            obs = nested_obs[0]  # only one agent for DQN impl.
             if flat_observation:
                 obs = obs.flatten()
             

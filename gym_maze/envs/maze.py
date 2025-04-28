@@ -141,6 +141,7 @@ class MazeEnv(gym.Env):
             self.traces[i].append(new_state)
             new_states.append(new_state)
 
+            # breakpoint()
             if self._goal_test(new_state, self.goal_states[i]):
                 self.goal_reached[i] = True
                 # If any agent reaches the goal for the first time, mark maze as solved
@@ -148,7 +149,7 @@ class MazeEnv(gym.Env):
                     self.maze_solved = True
                 reward = +1 * self.maze.size
                 done = True
-            elif new_state == old_state:
+            elif tuple(new_state) == tuple(old_state):
                 reward = -1
                 done = False
             else:
@@ -318,7 +319,7 @@ class MazeEnv(gym.Env):
             transitions = {0: [-1, 0], 1: [+1, 0], 2: [0, -1], 3: [0, +1],
                            4: [-1, +1], 5: [+1, +1], 6: [-1, -1], 7: [+1, -1]}
 
-        new_state = [state[0] + transitions[action][0], state[1] + transitions[action][1]]
+        new_state = np.array([state[0] + transitions[action][0], state[1] + transitions[action][1]])
         if self.maze[new_state[0]][new_state[1]] == 1:  # Hit wall, stay there
             return state
         else:  # Valid move for 0, 2, 3, 4
@@ -327,9 +328,9 @@ class MazeEnv(gym.Env):
     def _get_obs(self, agent_idx):
         state = self.states[agent_idx]
         if self.obs_type == 'full':
-            return self._get_full_obs().flatten()  # same for all agents
+            return self._get_full_obs().flatten().astype(int)  # same for all agents
         elif self.obs_type == 'partial':
-            return self._get_partial_obs(self.pob_size, state).flatten()
+            return self._get_partial_obs(self.pob_size, state).flatten().astype(int)
 
     def _get_full_obs(self):
         """Return a 2D array representation of maze with all agents and goals."""
