@@ -3,9 +3,10 @@ from gym_maze.envs.node import Node
 
 class BFSSolver(object):
     """Breadth-First Search solver for the maze."""
-    def __init__(self, env, goal):
+    def __init__(self, env, goal, start_state):
         self.env = env
         self.goal = goal
+        self.start_state = start_state
         self.solution_node = self._bfs_search()
 
     def solvable(self):
@@ -28,7 +29,7 @@ class BFSSolver(object):
         return states[::-1]
 
     def _bfs_search(self):
-        frontier = deque([Node(self.env.state)])
+        frontier = deque([Node(self.start_state)])
         explored = set()
 
         while frontier:
