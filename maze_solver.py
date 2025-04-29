@@ -20,7 +20,7 @@ def get_solver(name, env, goal, start_state):
     elif name == "dfs":
         return DFSSolver(env, goal)
     elif name == "dijkstra":
-        return DijkstraSolver(env, goal)
+        return DijkstraSolver(env, goal, start_state)
     else:
         raise ValueError(f"Unknown algorithm: {name}")
 

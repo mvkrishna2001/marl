@@ -4,9 +4,10 @@ from gym_maze.envs.algorithms.a_star import Frontier  # reuse Frontier class fro
 
 class DijkstraSolver:
     """Dijkstra's algorithm solver for the maze"""
-    def __init__(self, env, goal):
+    def __init__(self, env, goal, start_state):
         self.env = env
         self.goal = goal
+        self.start_state = start_state
         self.solution_node = self._dijkstra_search()
 
     def solvable(self):
@@ -30,7 +31,7 @@ class DijkstraSolver:
 
     def _dijkstra_search(self):
         f = lambda node: node.path_cost  # No heuristic
-        frontier = Frontier(Node(self.env.state), f)
+        frontier = Frontier(Node(self.start_state), f)
         explored = set()
 
         while frontier:
