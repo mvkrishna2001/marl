@@ -156,14 +156,15 @@ class MazeEnv(gym.Env):
                 reward = -0.01 * self.num_actions
                 done = False
 
+            rewards.append(reward)
+            dones.append(done)
+            infos.append({})  # Customize if needed
+
         # Calculate exploration percentage
         exploration_percentage = (len(self.visited_cells) / self.total_free_cells) * 100
 
         # Additional info
         info = {'exploration_percentage': exploration_percentage}
-        rewards.append(reward)
-        dones.append(done)
-        infos.append({})  # Customize if needed
 
         # Calculate exploration percentage
         exploration_percentage = (len(self.visited_cells) / self.total_free_cells) * 100
@@ -180,7 +181,7 @@ class MazeEnv(gym.Env):
         }
 
         self.states = new_states
-        return [self._get_obs(i) for i in range(len(self.states))], rewards, dones, False, info
+        return [self._get_obs(i) for i in range(len(self.states))], rewards, dones, [False] * len(actions), info
 
     def seed(self, seed=None):
         self.np_random, seed = seeding.np_random(seed)
