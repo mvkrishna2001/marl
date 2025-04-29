@@ -39,7 +39,12 @@ Example of use:
 ```angular2html
 python maze_solver.py --alg astar --maze block --num_agents 2 --gif data/block_maze.gif
 ```
+## Evaluating the mazes 
 
+Use the following command to evaluate on the same set of generated mazes:
+```angular2html
+python python mazes_evaluation.py
+```
 ## File Structure
 ```
 marl/
