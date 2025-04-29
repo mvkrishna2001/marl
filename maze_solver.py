@@ -18,7 +18,7 @@ def get_solver(name, env, goal, start_state):
     elif name == "bfs":
         return BFSSolver(env, goal, start_state)
     elif name == "dfs":
-        return DFSSolver(env, goal)
+        return DFSSolver(env, goal, start_state)
     elif name == "dijkstra":
         return DijkstraSolver(env, goal, start_state)
     else:

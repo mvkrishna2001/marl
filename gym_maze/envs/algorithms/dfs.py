@@ -2,9 +2,10 @@ from gym_maze.envs.node import Node
 
 class DFSSolver:
     """Depth-First Search solver for the maze"""
-    def __init__(self, env, goal):
+    def __init__(self, env, goal, start_state):
         self.env = env
         self.goal = goal
+        self.start_state = start_state
         self.solution_node = self._dfs_search()
 
     def solvable(self):
@@ -27,7 +28,7 @@ class DFSSolver:
         return states[::-1]
 
     def _dfs_search(self):
-        start_node = Node(self.env.state)
+        start_node = Node(self.start_state)
         stack = [start_node]
         explored = set()
 
