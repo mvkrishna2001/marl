@@ -1121,7 +1121,7 @@ def train_qmix(
                 f.write(f"{episode+1},{metrics['total_steps']},{metrics['total_revisits']},{metrics['unique_states_visited']},{metrics['exploration_percentage']},{1 if metrics['maze_solved'] else 0},{metrics['steps_to_solve']},{elapsed_time:.2f}\n")
         
         # Check if we've reached the exploration threshold
-        if metrics['exploration_percentage'] >= exploration_percentage_threshold:
+        if metrics['exploration_percentage'] > exploration_percentage_threshold:
             print(f"\nReached exploration threshold of {exploration_percentage_threshold}%!")
             print(f"Explored {metrics['unique_states_visited']} states out of {maze_size * maze_size} total")
             print(f"Training completed after {current_step} steps and {episode+1} episodes")
@@ -1440,7 +1440,7 @@ if __name__ == "__main__":
                         help="Final exploration rate")
     parser.add_argument("--epsilon_steps", type=int, default=1000,
                         help="Number of steps to decay epsilon over")
-    parser.add_argument("--exploration_threshold", type=float, default=90.0,
+    parser.add_argument("--exploration_threshold", type=float, default=100.0,
                         help="Stop training if exploration percentage exceeds this value")
     parser.add_argument("--log_every", type=int, default=10,
                         help="How often to log metrics (in episodes)")
@@ -1511,4 +1511,4 @@ if __name__ == "__main__":
             render=args.render,
             obs_type=args.obs_type,
             pob_size=args.pob_size
-        ) 
+        )
