@@ -65,3 +65,9 @@ marl/
 
 ## Notes
 The gym maze environment code is taken from https://github.com/rpinsler/gym-maze/tree/master, with minor modifications. 
+
+
+Open Qs:
+1. Size and kind of the maze for evaluating the algorithms
+2. Number of agents for a given size of the maze
+3. 
