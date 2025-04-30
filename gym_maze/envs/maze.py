@@ -248,8 +248,6 @@ class MazeEnv(gym.Env):
         self.np_random, seed = seeding.np_random(seed)
         return [seed]
 
-    def reset(self, num_agents):
-        # Generate or reset the maze layout
     def reset(self, num_agents=1, seed=None, options=None):
         # Set seed if provided
         if seed is not None:
@@ -398,7 +396,6 @@ class MazeEnv(gym.Env):
         return self.fig
 
     def _goal_test(self, state, goal):
-    def _goal_test(self, state, goal):
         """Return True if current state is a goal state."""
         return tuple(state) == tuple(goal)
         return tuple(state) == tuple(goal)
@@ -419,8 +416,6 @@ class MazeEnv(gym.Env):
         else:  # Valid move for 0, 2, 3, 4
             return new_state
 
-    def _get_obs(self, agent_idx):
-        state = self.states[agent_idx]
     def _get_obs(self, agent_idx):
         state = self.states[agent_idx]
         if self.obs_type == 'full':
@@ -454,7 +449,6 @@ class MazeEnv(gym.Env):
         return obs
 
     def _get_partial_obs(self, size=1, pos=None):
-    def _get_partial_obs(self, size=1, pos=None):
         """Get partial observable window according to Moore neighborhood"""
         # Get maze with indicated location of current position and goal positions
         if pos is None:
@@ -479,7 +473,6 @@ class MazeEnv(gym.Env):
 
         return maze[pos[0] - size: pos[0] + size + 1, pos[1] - size: pos[1] + size + 1]
 
-    def _get_video(self, interval=400, gif_path=None):
     def _get_video(self, interval=400, gif_path=None):
         if self.live_display:
             # TODO: Find a way to create animations without slowing down the live display
