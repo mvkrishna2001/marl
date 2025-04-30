@@ -8,6 +8,7 @@ import copy
 from tqdm import tqdm
 import logging
 import json
+from pathlib import Path
 
 import gymnasium as gym
 import numpy as np
@@ -22,9 +23,6 @@ from skrl.agents.torch.dqn import DQN as SKRL_DQN
 from skrl.resources.preprocessors.torch import RunningStandardScaler
 from skrl.memories.torch import RandomMemory
 from skrl.models.torch import DeterministicMixin, Model
-
-# Import gym_maze environment
-import gym_maze
 
 
 # Define Q-network architecture
@@ -111,6 +109,18 @@ def parse_args():
                         help="Type of observation (full or partial)")
     parser.add_argument("--pob-size", type=int, default=1,
                         help="Size of the partial observable window")
+    
+    # Training and testing options
+    parser.add_argument("--train", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
+                        help="Whether to train the agent or just test")
+    parser.add_argument("--test", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
+                        help="Whether to test the agent after training")
+    parser.add_argument("--test-episodes", type=int, default=5,
+                        help="Number of episodes to run during testing")
+    parser.add_argument("--model-path", type=str, default=None,
+                        help="Path to pre-trained model to load (for testing only)")
+    parser.add_argument("--render", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
+                        help="Whether to render the environment during testing")
     
     args = parser.parse_args()
     return args
@@ -262,13 +272,15 @@ def train_dqn(args):
     
     # Tracking variables
     global_step = 0
-    episode_rewards = []
-    episode_lengths = []
-    episode_exploration = []  # Track exploration percentage per episode
     episode_count = 0
     episode_reward = 0
     episode_length = 0
     episode_explored = 0  # Track exploration for current episode
+    
+    # Performance tracking
+    total_solved = 0
+    best_reward = float('-inf')
+    best_exploration = 0
     
     # Create progress bar
     pbar = tqdm(total=args.total_timesteps, desc="Training")
@@ -290,7 +302,17 @@ def train_dqn(args):
         # Update episode statistics
         episode_reward += reward
         episode_length += 1
-        episode_explored = info.get('exploration_percentage', 0)  # Get exploration percentage
+        
+        # Get maze metrics
+        exploration_percentage = info.get('exploration_percentage', 0)
+        total_revisits = info.get('total_revisits', 0)
+        unique_states_visited = info.get('unique_states_visited', 0)
+        maze_solved = info.get('maze_solved', False)
+        
+        # Log metrics at each step to show progress over time
+        writer.add_scalar("charts/exploration", exploration_percentage, global_step)
+        writer.add_scalar("charts/revisits", total_revisits, global_step)
+        writer.add_scalar("charts/unique_states", unique_states_visited, global_step)
         
         # Record transition
         agent.record_transition(
@@ -317,53 +339,87 @@ def train_dqn(args):
             
             # Log loss if available from the agent's latest update
             if hasattr(agent, 'loss'):
-                writer.add_scalar("charts/loss", agent.loss, global_step)
+                writer.add_scalar("Loss / Q-network loss", agent.loss, global_step)
             
-            # Log exploration percentage
-            writer.add_scalar("charts/exploration_percentage", episode_explored, global_step)
+            # Log epsilon
+            epsilon = agent.cfg["exploration"]["final_epsilon"]
+            if global_step < agent.cfg["exploration"]["timesteps"]:
+                # Calculate current epsilon based on linear decay
+                epsilon = agent.cfg["exploration"]["initial_epsilon"] - (agent.cfg["exploration"]["initial_epsilon"] - 
+                              agent.cfg["exploration"]["final_epsilon"]) * (global_step / agent.cfg["exploration"]["timesteps"])
+            writer.add_scalar("Exploration / Exploration epsilon", epsilon, global_step)
         
         # Update observation
         obs = next_obs
         
+        # Safety check - terminate very long episodes
+        max_episode_safety_limit = 2000
+        if episode_length >= max_episode_safety_limit:
+            logger.info(f"Terminating episode after {episode_length} steps (safety limit)")
+            done = True
+        
         # Handle episode completion
         if done:
+            # Log if maze was solved and steps to solve
+            if maze_solved:
+                total_solved += 1
+                steps_to_solve = info.get('steps_to_solve', episode_length)
+                writer.add_scalar("charts/steps_to_solve", steps_to_solve, global_step)
+                writer.add_scalar("charts/solved", 1, global_step)  # Binary flag for solving
+            else:
+                writer.add_scalar("charts/solved", 0, global_step)  # Not solved
+            
+            # Calculate success rate
+            episode_count += 1
+            success_rate = (total_solved / episode_count) * 100
+            
+            # Track best metrics
+            if exploration_percentage > best_exploration:
+                best_exploration = exploration_percentage
+            if episode_reward > best_reward:
+                best_reward = episode_reward
+            
+            # Log episode statistics
+            writer.add_scalar("charts/episode_reward", episode_reward, global_step)
+            writer.add_scalar("charts/episode_length", episode_length, global_step)
+            writer.add_scalar("charts/success_rate", success_rate, global_step)
+            writer.add_scalar("charts/best_exploration", best_exploration, global_step)
+            writer.add_scalar("charts/best_reward", best_reward, global_step)
+            
+            # Log to console
+            if episode_count % 10 == 0:
+                logger.info(f"Episode {episode_count} - Step {global_step}")
+                logger.info(f"  Reward: {episode_reward:.2f} (best: {best_reward:.2f})")
+                logger.info(f"  Steps: {episode_length}")
+                logger.info(f"  Exploration: {exploration_percentage:.2f}% (best: {best_exploration:.2f}%)")
+                logger.info(f"  Success Rate: {success_rate:.2f}%")
+                logger.info(f"  Unique states visited: {unique_states_visited}")
+                logger.info(f"  Revisits: {total_revisits}")
+                if maze_solved:
+                    logger.info(f"  Solved in {steps_to_solve} steps!")
+                
+                # Save model checkpoint periodically
+                if episode_count % 100 == 0:
+                    checkpoint_path = os.path.join(checkpoint_dir, f"model_ep{episode_count}.pt")
+                    torch.save(online_net.state_dict(), checkpoint_path)
+                    logger.info(f"Saved checkpoint to {checkpoint_path}")
+            
             # Reset environment
             nested_obs, _ = env.reset(seed=args.seed)
             obs = nested_obs[0]  # only one agent for DQN impl.
             if flat_observation:
                 obs = obs.flatten()
             
-            # Log episode statistics
-            episode_count += 1
-            episode_rewards.append(episode_reward)
-            episode_lengths.append(episode_length)
-            episode_exploration.append(episode_explored)  # Store final exploration percentage
-            
-            # Log to tensorboard
-            writer.add_scalar("charts/episode_reward", episode_reward, global_step)
-            writer.add_scalar("charts/episode_length", episode_length, global_step)
-            writer.add_scalar("charts/episode_exploration", episode_explored, global_step)
-            writer.flush()  # Force write to disk
-            
-            # Log to console
-            if episode_count % 10 == 0:
-                avg_reward = np.mean(episode_rewards[-10:])
-                avg_length = np.mean(episode_lengths[-10:])
-                avg_exploration = np.mean(episode_exploration[-10:])
-                logger.info(f"Episode {episode_count} - Average Reward (last 10): {avg_reward:.2f}, Average Length: {avg_length:.2f}, Average Exploration: {avg_exploration:.2f}%")
-            
             # Reset episode statistics
             episode_reward = 0
             episode_length = 0
-            episode_explored = 0
         
         # Update progress bar
         pbar.update(1)
         pbar.set_postfix({
             "episode": episode_count,
             "reward": episode_reward,
-            "length": episode_length,
-            "explored": f"{episode_explored:.1f}%"
+            "exploration": f"{exploration_percentage:.1f}%"
         })
     
     # Close progress bar
@@ -373,21 +429,300 @@ def train_dqn(args):
     torch.save(online_net.state_dict(), f"{log_dir}/final_model_{run_name}.pt")
     logger.info(f"Saved final model to {log_dir}/final_model_{run_name}.pt")
     
+    # Save performance metrics
+    performance = {
+        "total_episodes": episode_count,
+        "total_steps": global_step,
+        "total_solved": total_solved,
+        "success_rate": success_rate,
+        "best_reward": best_reward,
+        "best_exploration": best_exploration
+    }
+    
+    with open(os.path.join(log_dir, "performance.json"), "w") as f:
+        json.dump(performance, f, indent=4)
+    
     # Close environment and writer
     env.close()
     writer.close()
     
-    # Log final statistics
-    logger.info(f"Training completed after {args.total_timesteps} timesteps")
-    logger.info(f"Total episodes: {episode_count}")
-    logger.info(f"Average reward: {np.mean(episode_rewards):.2f} ± {np.std(episode_rewards):.2f}")
-    logger.info(f"Average episode length: {np.mean(episode_lengths):.2f} ± {np.std(episode_lengths):.2f}")
-    
-    # Generate plots after writer is closed
+    # Generate plots using plotting module
     from plotting import plot_training_metrics
-    plot_training_metrics(log_dir, save_path=os.path.join(log_dir, "training_metrics.png"))
+    plot_path = plot_training_metrics(log_dir)
+    logger.info(f"Training metrics plots saved to: {plot_path}")
+    
+    # Return trained agent and path
+    return agent, log_dir
+
+
+def test_dqn(agent=None, model_path=None, maze_size=15, observation_type="full", pob_size=1, 
+           n_episodes=5, device="cpu", render=True):
+    """
+    Test a trained DQN agent on the maze environment.
+    
+    Args:
+        agent: Trained DQN agent (if None, will load from model_path)
+        model_path: Path to a saved model file
+        maze_size: Size of the maze
+        observation_type: Type of observation space ("full" or "partial")
+        pob_size: Size of partial observation window if using partial obs
+        n_episodes: Number of episodes to test
+        device: Device to run inference on
+        render: Whether to render the environment during testing
+        
+    Returns:
+        scores: Dictionary of test performance metrics
+    """
+    # Set device
+    device = torch.device(device)
+    from gym_maze.envs import MazeEnv
+    from gym_maze.envs.generators import RandomMazeGenerator, RandomBlockMazeGenerator    
+    # Create environment
+    env = MazeEnv(
+        maze_generator=RandomBlockMazeGenerator(maze_size, obstacle_ratio=0.1),
+        pob_size=pob_size,
+        obs_type=observation_type,
+        render_trace=True,
+        live_display=render
+    )
+    
+    # Reset to get observation shape
+    nested_obs, _ = env.reset()
+    obs = nested_obs[0]
+    if observation_type in ["full", "partial"]:
+        flat_observation = True
+        if observation_type == "full":
+            state_dim = maze_size * maze_size
+        else:  # partial
+            state_dim = (pob_size * 2 + 1) ** 2
+    else:
+        raise ValueError(f"Unsupported observation type: {observation_type}")
+    
+    # Flatten observation if needed
+    if flat_observation:
+        obs = obs.flatten()
+    
+    # Get action dimension
+    action_dim = env.action_space.n
+    
+    print(f"Testing with observation dimension: {state_dim}, action dimension: {action_dim}")
+    
+    # Create or load the agent
+    if agent is None and model_path is not None:
+        # Create networks
+        q_network = QNetwork(state_dim, action_dim).to(device)
+        target_network = QNetwork(state_dim, action_dim).to(device)
+        
+        # Load weights
+        q_network.load_state_dict(torch.load(model_path, map_location=device))
+        target_network.load_state_dict(q_network.state_dict())
+        
+        # Create dummy memory (not used for testing)
+        memory = RandomMemory(memory_size=10, device=device)
+        
+        # Create agent with simplified configuration
+        agent = SKRL_DQN(
+            models={
+                "q_network": q_network,
+                "target_q_network": target_network
+            },
+            memory=memory,
+            observation_space=env.observation_space,
+            action_space=env.action_space,
+            device=device,
+            cfg={
+                "exploration": {
+                    "initial_epsilon": 0.0,  # No exploration during testing
+                    "final_epsilon": 0.0,
+                    "timesteps": 1
+                }
+            }
+        )
+        agent.init()
+        
+        # Disable state preprocessing
+        agent._state_preprocessor = None
+    elif agent is None:
+        raise ValueError("Either agent or model_path must be provided")
+    
+    # Run test episodes
+    scores = []
+    success_count = 0
+    steps_to_solve = []
+    exploration_percentages = []
+    revisits_list = []
+    unique_states_list = []
+    
+    for episode in range(1, n_episodes + 1):
+        # Reset environment
+        nested_obs, _ = env.reset()
+        obs = nested_obs[0]
+        if flat_observation:
+            obs = obs.flatten()
+        obs = obs.astype(np.float32)
+        
+        # Initialize episode variables
+        episode_reward = 0
+        episode_steps = 0
+        done = False
+        
+        print(f"\nStarting test episode {episode}/{n_episodes}")
+        
+        # Episode loop
+        while not done:
+            # Get action using the trained agent (no exploration)
+            # Move observation to the correct device before passing to agent
+            obs_tensor = torch.from_numpy(obs).view(1, -1).to(device)
+            action = agent.act(obs_tensor, timestep=0, timesteps=1)[0]
+            action = action.item()
+            
+            # Take action in environment
+            next_nested_obs, rewards, dones, truncated, info = env.step([action])
+            next_obs = next_nested_obs[0]
+            reward = rewards[0]
+            done = dones[0] or truncated[0]
+            
+            # Flatten if needed
+            if flat_observation:
+                next_obs = next_obs.flatten()
+            next_obs = next_obs.astype(np.float32)
+            
+            # Update episode statistics
+            episode_reward += reward
+            episode_steps += 1
+            
+            # Get current metrics
+            if episode_steps % 100 == 0:
+                print(f"  Step {episode_steps}, Reward so far: {episode_reward:.2f}")
+                print(f"  Exploration: {info.get('exploration_percentage', 0):.2f}%, "
+                      f"Unique states: {info.get('unique_states_visited', 0)}")
+            
+            # Update observation
+            obs = next_obs
+            
+            # Safety check - terminate very long episodes
+            if episode_steps >= 5000:
+                print(f"  Terminating episode after {episode_steps} steps (safety limit)")
+                break
+        
+        # Episode complete
+        # Record metrics
+        maze_solved = info.get('maze_solved', False)
+        exploration_pct = info.get('exploration_percentage', 0)
+        revisits = info.get('total_revisits', 0)
+        unique_states = info.get('unique_states_visited', 0)
+        
+        scores.append(episode_reward)
+        exploration_percentages.append(exploration_pct)
+        revisits_list.append(revisits)
+        unique_states_list.append(unique_states)
+        
+        if maze_solved:
+            success_count += 1
+            steps_to_complete = info.get('steps_to_solve', episode_steps)
+            steps_to_solve.append(steps_to_complete)
+            solved_text = f"SOLVED in {steps_to_complete} steps"
+        else:
+            solved_text = "NOT SOLVED"
+        
+        # Print episode summary
+        print(f"Episode {episode} finished: {solved_text}")
+        print(f"  Reward: {episode_reward:.2f}")
+        print(f"  Steps: {episode_steps}")
+        print(f"  Exploration: {exploration_pct:.2f}%")
+        print(f"  Revisits: {revisits}")
+        print(f"  Unique states: {unique_states}")
+    
+    # Calculate summary statistics
+    success_rate = (success_count / n_episodes) * 100
+    avg_reward, std_reward = np.mean(scores), np.std(scores)
+    avg_exploration, std_exploration = np.mean(exploration_percentages), np.std(exploration_percentages)
+    avg_revisits, std_revisits = np.mean(revisits_list), np.std(revisits_list)
+    avg_unique_states, std_unique_states = np.mean(unique_states_list), np.std(unique_states_list)
+    
+    # Calculate average steps to solve if there were successful episodes
+    if steps_to_solve:
+        avg_steps_to_solve, std_steps_to_solve = np.mean(steps_to_solve), np.std(steps_to_solve)
+    else:
+        avg_steps_to_solve = None
+    
+    # Print summary
+    print("\n" + "="*50)
+    print(f"Test Results ({n_episodes} episodes):")
+    print(f"  Success Rate: {success_rate:.2f}%")
+    print(f"  Average Reward: {avg_reward:.2f} ± {std_reward:.2f}")
+    print(f"  Average Exploration: {avg_exploration:.2f}% ± {std_exploration:.2f}%")
+    print(f"  Average Revisits: {avg_revisits:.2f} ± {std_revisits:.2f}")
+    print(f"  Average Unique States: {avg_unique_states:.2f} ± {std_unique_states:.2f}")
+    if avg_steps_to_solve is not None:
+        print(f"  Average Steps to Solve: {avg_steps_to_solve:.2f} ± {std_steps_to_solve:.2f}")
+    print("="*50)
+    
+    # Close environment
+    env.close()
+    
+    # Return results
+    test_results = {
+        'success_rate': success_rate,
+        'avg_reward': avg_reward,
+        'avg_exploration': avg_exploration,
+        'avg_revisits': avg_revisits,
+        'avg_unique_states': avg_unique_states,
+        'avg_steps_to_solve': avg_steps_to_solve,
+        'episode_rewards': scores,
+        'exploration_percentages': exploration_percentages,
+        'revisits': revisits_list,
+        'unique_states': unique_states_list,
+        'steps_to_solve': steps_to_solve
+    }
+    
+    return test_results
 
 
 if __name__ == "__main__":
     args = parse_args()
-    train_dqn(args)
+    
+    # Train the agent
+    if getattr(args, 'train', True):
+        agent, log_dir = train_dqn(args)
+        print(f"Training completed. Model saved to {log_dir}")
+    
+    # Test the agent if requested
+    if getattr(args, 'test', True):
+        if not getattr(args, 'train', True):
+            # If we didn't train, we need a model path
+            model_path = args.model_path if hasattr(args, 'model_path') else None
+            if not model_path:
+                # Try to find the most recent model
+                log_dirs = sorted(Path("logs").glob("dqn_*"), key=lambda x: x.stat().st_mtime, reverse=True)
+                if log_dirs:
+                    model_path = str(next(log_dirs[0].glob("final_model_*.pt"), None))
+                    if not model_path:
+                        print("No model found for testing. Please specify --model_path")
+                        exit(1)
+                    print(f"Using most recent model: {model_path}")
+            
+            test_results = test_dqn(
+                model_path=model_path,
+                maze_size=args.maze_size,
+                observation_type=args.observation_type,
+                pob_size=args.pob_size,
+                n_episodes=getattr(args, 'test_episodes', 5),
+                render=getattr(args, 'render', True)
+            )
+        else:
+            # Use the agent we just trained
+            test_results = test_dqn(
+                agent=agent,
+                maze_size=args.maze_size,
+                observation_type=args.observation_type,
+                pob_size=args.pob_size,
+                n_episodes=getattr(args, 'test_episodes', 5),
+                render=getattr(args, 'render', True)
+            )
+        
+        # Save test results
+        if 'log_dir' in locals():
+            import json
+            with open(os.path.join(log_dir, "test_results.json"), "w") as f:
+                json.dump(test_results, f, indent=4, default=lambda x: float(x) if isinstance(x, np.float32) else x)

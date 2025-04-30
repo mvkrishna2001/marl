@@ -132,39 +132,55 @@ class MazeEnv(gym.Env):
             
             # Update state visit counts
             pos_tuple = tuple(new_state)
+            first_visit = False
             if pos_tuple in self.state_visit_counts:
                 self.state_visit_counts[pos_tuple] += 1
                 self.total_revisits += 1
+                revisit_count = self.state_visit_counts[pos_tuple]
             else:
                 self.state_visit_counts[pos_tuple] = 1
+                first_visit = True
+                revisit_count = 0
                 
             self.traces[i].append(new_state)
             new_states.append(new_state)
 
-            # breakpoint()
-            if self._goal_test(new_state, self.goal_states[i]):
+            # Check if agent reached any goal state
+            goal_reached = any(self._goal_test(new_state, goal) for goal in self.goal_states)
+            if goal_reached:
                 self.goal_reached[i] = True
-                # If any agent reaches the goal for the first time, mark maze as solved
+                # If any agent reaches any goal for the first time, mark maze as solved
                 if not self.maze_solved:
                     self.maze_solved = True
                 reward = +1 * self.maze.size
                 done = True
             elif tuple(new_state) == tuple(old_state):
+                # Hit a wall, penalize
                 reward = -1
                 done = False
             else:
+                # Base movement cost
                 reward = -0.01 * self.num_actions
+                
+                # Add exploration bonus for finding new states
+                if first_visit:
+                    reward += 0.5  # Reward for discovering a new cell
+                
+                # Add revisit penalty that increases with the number of revisits
+                else:
+                    # Scale penalty with number of revisits (more revisits = larger penalty)
+                    revisit_penalty = -0.2 * min(revisit_count, 5)  # Cap penalty at -1.0
+                    reward += revisit_penalty
+                    
                 done = False
+
+            if self.total_steps > 1500:
+                reward -= 500
+                done = True
 
             rewards.append(reward)
             dones.append(done)
             infos.append({})  # Customize if needed
-
-        # Calculate exploration percentage
-        exploration_percentage = (len(self.visited_cells) / self.total_free_cells) * 100
-
-        # Additional info
-        info = {'exploration_percentage': exploration_percentage}
 
         # Calculate exploration percentage
         exploration_percentage = (len(self.visited_cells) / self.total_free_cells) * 100
@@ -371,6 +387,12 @@ class MazeEnv(gym.Env):
         if self.live_display:
             # TODO: Find a way to create animations without slowing down the live display
             print('Warning: Generating an Animation when live_display=True not yet supported.')
+            return None
+            
+        if not self.ax_imgs:
+            print('Warning: No frames to animate. Make sure render() is called with live_display=False.')
+            return None
+            
         anim = animation.ArtistAnimation(self.fig, self.ax_imgs, interval=interval)
 
         if gif_path is not None:

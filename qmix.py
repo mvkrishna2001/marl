@@ -6,133 +6,85 @@ import torch.optim as optim
 import gymnasium as gym
 import time
 import os
-import copy  # Add import for copy module
+import copy
 from datetime import datetime
+import logging
+import matplotlib.pyplot as plt
+import pandas as pd
+from pathlib import Path
+import seaborn as sns
+import json
+
 from skrl.agents.torch.dqn.dqn import DQN
 from skrl.memories.torch import RandomMemory
 from skrl.models.torch import Model, DeterministicMixin
 from skrl.resources.preprocessors.torch import RunningStandardScaler
-from skrl.envs.wrappers.torch import wrap_env
 from skrl.multi_agents.torch import MultiAgent
 
 # Use gym_maze's built-in multi-agent support
 from gym_maze.envs import MazeEnv
+from gym_maze.envs.enhanced_maze import EnhancedMazeEnv
 from gym_maze.envs.generators import RandomBlockMazeGenerator
+
 
 # QMIX Mixing Network as a skrl Model
 class MixingNetwork(Model):
-    def __init__(self, observation_space, action_space, device="cpu", clip_actions=False, 
+    def __init__(self, observation_space, action_space, device="cpu", 
                  num_agents=2, mixing_embed_dim=32, hypernet_embed=64):
         """
         Mixer network for QMIX that takes individual Q-values and mixes them monotonically.
-        
-        The network uses hypernetworks to generate weights that ensure monotonicity,
-        which guarantees that the team value function increases whenever any agent's 
-        individual Q-function increases.
-        
-        Args:
-            observation_space: Global state space
-            action_space: Action space (not used for mixing network)
-            device: Device to use for computation ("cpu" or "cuda:X")
-            clip_actions: Whether to clip actions
-            num_agents: Number of agents in the environment
-            mixing_embed_dim: Dimension of the mixing network
-            hypernet_embed: Dimension of the hypernetwork embedding
         """
         super().__init__(observation_space, action_space, device)
         
         self.num_agents = num_agents
         self.state_dim = observation_space.shape[0]
         self.mixing_embed_dim = mixing_embed_dim
-        self.hypernet_embed = hypernet_embed
         
-        print(f"MixingNetwork initialized with state_dim={self.state_dim}, num_agents={self.num_agents}")
-        
-        # Hypernetworks to generate weights and biases for the mixing network
+        # Hypernetworks for weights and biases
         self.hyper_w1 = nn.Sequential(
             nn.Linear(self.state_dim, hypernet_embed),
             nn.ReLU(),
             nn.Linear(hypernet_embed, num_agents * mixing_embed_dim)
         )
-        
         self.hyper_w2 = nn.Sequential(
             nn.Linear(self.state_dim, hypernet_embed),
             nn.ReLU(),
             nn.Linear(hypernet_embed, mixing_embed_dim)
         )
-        
         self.hyper_b1 = nn.Linear(self.state_dim, mixing_embed_dim)
         self.hyper_b2 = nn.Sequential(
             nn.Linear(self.state_dim, hypernet_embed),
             nn.ReLU(),
             nn.Linear(hypernet_embed, 1)
         )
-        
         self.to(device)
         
-    def forward(self, agent_qs, states):
+    def forward(self, agent_qs: torch.Tensor, states: torch.Tensor):
         """
         Forward pass through the mixing network.
-        
-        Args:
-            agent_qs: Individual agent Q-values [batch_size, num_agents]
-            states: Global state [batch_size, state_dim]
-            
-        Returns:
-            q_tot: Global Q-value [batch_size, 1]
         """
-        # Ensure states has the right dimensions and shape
         if states.dim() == 1:
             states = states.unsqueeze(0)  # Add batch dimension if missing
             
-        # Print debug info on first forward pass
-        if not hasattr(self, '_printed_shapes'):
-            print(f"MixingNetwork forward: agent_qs shape={agent_qs.shape}, states shape={states.shape}")
-            self._printed_shapes = True
-            
         batch_size = agent_qs.size(0)
         
-        # First layer weights
-        w1 = self.hyper_w1(states).view(batch_size, self.num_agents, self.mixing_embed_dim)
-        b1 = self.hyper_b1(states).view(batch_size, 1, self.mixing_embed_dim)
-        
-        # Second layer weights
-        w2 = self.hyper_w2(states).view(batch_size, self.mixing_embed_dim, 1)
-        b2 = self.hyper_b2(states).view(batch_size, 1, 1)
-        
-        # Apply ELU activation to ensure positive weights for monotonicity
-        w1 = torch.abs(w1)
-        w2 = torch.abs(w2)
-        
         # First layer
+        w1 = torch.abs(self.hyper_w1(states)).view(batch_size, self.num_agents, -1)
+        b1 = self.hyper_b1(states).view(batch_size, 1, -1)
         hidden = F.elu(torch.bmm(agent_qs.unsqueeze(1), w1) + b1)
         
         # Second layer
-        q_tot = torch.bmm(hidden, w2) + b2
+        w2 = torch.abs(self.hyper_w2(states)).view(batch_size, -1, 1)
+        b2 = self.hyper_b2(states).view(batch_size, 1, 1)
         
-        return q_tot.squeeze(-1)
+        return (torch.bmm(hidden, w2) + b2).squeeze(-1)
 
 
-# QMIX Agent implementation using skrl's MultiAgent base class
+# QMIX Agent implementation using skrl's MultiAgent
 class QMIXAgent(MultiAgent):
     def __init__(self, agents, models, mixing_network, memory, 
                  cfg=None, observation_space=None, action_space=None, device="cpu"):
-        """
-        Initialize the QMIX agent.
-        
-        QMIX is a multi-agent reinforcement learning algorithm that learns a centralized 
-        value function that factors into a per-agent value function to allow decentralized execution.
-        
-        Args:
-            agents: List of DQN instances
-            models: List of models
-            mixing_network: Mixing network instance
-            memory: Memory instance
-            cfg: Configuration dictionary
-            observation_space: Observation space
-            action_space: Action space
-            device: Device to use for computation ("cpu" or "cuda:X")
-        """
+        """QMIX agent implementation."""
         super().__init__(
             possible_agents=[f"agent_{i}" for i in range(len(agents))],
             models={f"agent_{i}": models[i] for i in range(len(agents))},
@@ -140,58 +92,26 @@ class QMIXAgent(MultiAgent):
         )
         
         self.mixing_network = mixing_network
-        self.target_mixing_network = mixing_network.__class__(
-            observation_space=mixing_network.observation_space,
-            action_space=mixing_network.action_space,
-            device=device,
-            num_agents=mixing_network.num_agents,
-            mixing_embed_dim=mixing_network.mixing_embed_dim,
-            hypernet_embed=mixing_network.hypernet_embed
-        )
-        
-        # Copy weights from main network to target network
-        self.target_mixing_network.load_state_dict(mixing_network.state_dict())
-        
-        self.memory: QMIXMemory = memory
+        self.target_mixing_network = copy.deepcopy(mixing_network)
+        self.memory = memory
         self.cfg = cfg if cfg is not None else {}
         self.observation_space = observation_space
         self.action_space = action_space
         
-        # Configure optimizer for mixing network
-        lr = self.cfg.get("learning_rate", 1e-3)
-        self.optimizer = optim.Adam(self.mixing_network.parameters(), lr=lr)
-        
-        # Set other hyperparameters
+        # Configure optimizer and hyperparameters
+        self.optimizer = optim.Adam(self.mixing_network.parameters(), 
+                                  lr=self.cfg.get("learning_rate", 1e-3))
         self.gamma = self.cfg.get("gamma", 0.99)
         self.batch_size = self.cfg.get("batch_size", 32)
-        self.target_update_frequency = self.cfg.get("target_update_frequency", 100)
+        self.target_update_frequency = self.cfg.get("target_update_frequency", 1000)
         self.num_agents = len(agents)
-        self.agents: list[DQN] = agents
-        # Training steps counter
+        self.agents = agents
         self.training_steps = 0
-        
-        # Flag to indicate we've checked DQN agent updates
-        self.checked_dqn_updates = False
+        self.loss = 0.0
     
     def act(self, states, timestamp=0, timesteps=0):
-        """
-        Get actions for each agent based on their observations.
-        
-        Args:
-            states: List of states, one for each agent
-            
-        Returns:
-            actions: List of integer actions, one for each agent
-        """
+        """Get actions for each agent based on their observations."""
         actions = []
-        
-        # Print debug info on first call
-        if not hasattr(self, '_printed_act_shapes'):
-            print(f"QMIXAgent.act: states types and shapes:")
-            for i, state in enumerate(states):
-                print(f"  Agent {i}: type={type(state)}, shape={state.shape if hasattr(state, 'shape') else 'N/A'}")
-            self._printed_act_shapes = True
-        
         for i, state in enumerate(states):
             # Convert state to tensor if it's not already
             if not isinstance(state, torch.Tensor):
@@ -200,122 +120,52 @@ class QMIXAgent(MultiAgent):
             # Add batch dimension if needed
             if state.dim() == 1:
                 state = state.unsqueeze(0)
-                
-            # Ensure state has the expected shape
-            if i == 0 and not hasattr(self, '_printed_state_shape'):
-                print(f"Agent {i} input state shape: {state.shape}")
-                self._printed_state_shape = True
             
             # Get action from agent's network
             with torch.no_grad():
                 action, _, _ = self.agents[i].act(state, timestamp, timesteps)
-                # Convert action to integer and move to CPU
-                action = action.item() if isinstance(action, torch.Tensor) else int(action)
-                actions.append(action)
-        
+                actions.append(action.item() if isinstance(action, torch.Tensor) else int(action))
         return actions
     
+    def _to_tensor(self, data, dtype=None, device=None):
+        if not isinstance(data, torch.Tensor):
+            data = torch.tensor(data, dtype=dtype, device=device or self.device)
+        if data.dim() == 0:
+            data = data.unsqueeze(0)
+        return data
+    
     def record_transition(self, states, actions, rewards, next_states, dones, global_state=None, next_global_state=None):
-        """
-        Record a transition in memory.
+        # Convert all inputs to tensors
+        states = [self._to_tensor(s, torch.float32) for s in states]
+        next_states = [self._to_tensor(s, torch.float32) for s in next_states]
+        actions = [self._to_tensor(a, torch.long) for a in actions]
+        rewards = [self._to_tensor(r, torch.float32) for r in rewards]
+        dones = [self._to_tensor(d, torch.bool) for d in dones]
         
-        Args:
-            states: List of agent observations
-            actions: List of agent actions
-            rewards: List of agent rewards
-            next_states: List of next agent observations
-            dones: List of done flags
-            global_state: Global state
-            next_global_state: Next global state
-        """
-        # Convert individual agent observations into a batch tensor [batch=1, num_agents, obs_dim]
-        batch_states = []
-        batch_next_states = []
-        batch_actions = []
-        batch_rewards = []
-        batch_dones = []
-        
-        for i in range(len(states)):
-            # Convert state to tensor if needed
-            if not isinstance(states[i], torch.Tensor):
-                state = torch.tensor(states[i], dtype=torch.float32, device=self.device)
-            else:
-                state = states[i]
-            
-            # Add batch dimension if needed
-            if state.dim() == 1:
-                state = state.unsqueeze(0)
-            batch_states.append(state)
-            
-            # Convert next_state to tensor if needed
-            if not isinstance(next_states[i], torch.Tensor):
-                next_state = torch.tensor(next_states[i], dtype=torch.float32, device=self.device)
-            else:
-                next_state = next_states[i]
-            
-            # Add batch dimension if needed
-            if next_state.dim() == 1:
-                next_state = next_state.unsqueeze(0)
-            batch_next_states.append(next_state)
-            
-            # Convert action to tensor if needed
-            if not isinstance(actions[i], torch.Tensor):
-                action = torch.tensor(actions[i], dtype=torch.long, device=self.device)
-            else:
-                action = actions[i]
-            if action.dim() == 0:
-                action = action.unsqueeze(0)
-            batch_actions.append(action)
-            
-            # Convert reward to tensor if needed
-            if not isinstance(rewards[i], torch.Tensor):
-                reward = torch.tensor(rewards[i], dtype=torch.float32, device=self.device)
-            else:
-                reward = rewards[i]
-            if reward.dim() == 0:
-                reward = reward.unsqueeze(0)
-            batch_rewards.append(reward)
-            
-            # Convert done to tensor if needed
-            if not isinstance(dones[i], torch.Tensor):
-                done = torch.tensor(dones[i], dtype=torch.bool, device=self.device)
-            else:
-                done = dones[i]
-            if done.dim() == 0:
-                done = done.unsqueeze(0)
-            batch_dones.append(done)
-            
-            # Record transition in individual agent's memory
-            self.agents[i].memory.add_samples(
-                observations=state,
-                actions=action,
-                rewards=reward,
-                next_observations=next_state,
-                dones=done
+        # Record transitions for individual agents
+        for i, agent in enumerate(self.agents):
+            agent.memory.add_samples(
+                observations=states[i],
+                actions=actions[i],
+                rewards=rewards[i],
+                next_observations=next_states[i],
+                dones=dones[i]
             )
         
-        # Stack into batch tensors [batch=1, num_agents, ...]
-        states_tensor = torch.cat(batch_states, dim=0).unsqueeze(0)
-        next_states_tensor = torch.cat(batch_next_states, dim=0).unsqueeze(0)
-        actions_tensor = torch.cat(batch_actions, dim=0).unsqueeze(0)
-        rewards_tensor = torch.cat(batch_rewards, dim=0).unsqueeze(0)
-        dones_tensor = torch.cat(batch_dones, dim=0).unsqueeze(0)
+        # Stack into batch tensors
+        states_tensor = torch.cat(states, dim=0).unsqueeze(0)
+        next_states_tensor = torch.cat(next_states, dim=0).unsqueeze(0)
+        actions_tensor = torch.cat(actions, dim=0).unsqueeze(0)
+        rewards_tensor = torch.cat(rewards, dim=0).unsqueeze(0)
+        dones_tensor = torch.cat(dones, dim=0).unsqueeze(0)
         
-        # Convert global states to tensors if needed
-        if global_state is not None and not isinstance(global_state, torch.Tensor):
-            global_state = torch.tensor(global_state, dtype=torch.float32, device=self.device)
+        # Convert global states if provided
+        if global_state is not None:
+            global_state = self._to_tensor(global_state, torch.float32)
+        if next_global_state is not None:
+            next_global_state = self._to_tensor(next_global_state, torch.float32)
         
-        if next_global_state is not None and not isinstance(next_global_state, torch.Tensor):
-            next_global_state = torch.tensor(next_global_state, dtype=torch.float32, device=self.device)
-        
-        # Add batch dimension to global states if needed
-        if global_state is not None and global_state.dim() == 1:
-            global_state = global_state.unsqueeze(0)
-        
-        if next_global_state is not None and next_global_state.dim() == 1:
-            next_global_state = next_global_state.unsqueeze(0)
-        
-        # Store transition in QMIX memory
+        # Store in QMIX memory
         self.memory.add_samples(
             observations=states_tensor,
             actions=actions_tensor,
@@ -327,15 +177,7 @@ class QMIXAgent(MultiAgent):
         )
     
     def post_interaction(self, current_step, training_steps):
-        """
-        Update the QMIX agent (mixing network and individual agents).
-        
-        This method samples from the replay buffer, computes the loss, and updates
-        both the individual agent networks and the mixing network.
-        
-        Returns:
-            info: Dictionary with training metrics
-        """
+        """Update the QMIX agent (mixing network and individual agents)."""
         self.training_steps += 1
         
         # Skip update if we don't have enough samples
@@ -343,83 +185,29 @@ class QMIXAgent(MultiAgent):
             return {}
         
         try:
-            # Print memory debug info
-            if not hasattr(self, '_printed_memory_debug'):
-                print("\nMemory Debug Information:")
-                print(f"QMIX Memory tensors: {list(self.memory.tensors.keys()) if hasattr(self.memory, 'tensors') else 'Unknown'}")
-                print(f"QMIX Memory filled: {self.memory.filled}")
-                
-                for i, agent in enumerate(self.agents):
-                    if hasattr(agent.memory, 'tensors'):
-                        print(f"Agent {i} Memory tensors: {list(agent.memory.tensors.keys())}")
-                        print(f"Agent {i} Memory filled: {agent.memory.filled}")
-                    else:
-                        print(f"Agent {i} Memory tensors: Unknown")
-                self._printed_memory_debug = True
+            # Get required tensor names for sampling
+            required_names = ["observations", "actions", "rewards", "next_observations", "dones", 
+                           "global_states", "next_global_states"]
             
-            # Get a list of available tensors in the memory
-            if hasattr(self.memory, 'tensors'):
-                available_tensors = list(self.memory.tensors.keys()) 
-                if hasattr(self.memory, 'global_states'):
-                    available_tensors += ["global_states", "next_global_states"]
-            else:
-                # If we can't determine available tensors, use a standard set
-                available_tensors = ["observations", "actions", "rewards", "next_observations", "dones", 
-                                    "global_states", "next_global_states"]
-            
-            # Check which tensors we actually need and are available
-            required_names = []
-            for name in ["observations", "actions", "rewards", "next_observations", "dones", "global_states", "next_global_states"]:
-                if name in available_tensors:
-                    required_names.append(name)
-                else:
-                    print(f"Warning: Tensor '{name}' not available in memory, skipping it in sampling")
-            
-            if len(required_names) < 5:  # We need at least observations, actions, rewards, next_observations, dones
-                print(f"Not enough tensors available: {required_names}")
-                return {}
-            
-            # Sample a batch from memory with only available tensors
-            batch = self.memory.sample(names=required_names, batch_size=self.batch_size)[0]  # Get the first (and only) mini-batch
+            # Sample a batch from memory
+            batch = self.memory.sample(names=required_names, batch_size=self.batch_size)[0]
             
             # Extract batch data
-            idx = 0
-            for name in required_names:
-                if name == "observations":
-                    states = batch[idx]
-                elif name == "actions":
-                    actions = batch[idx]
-                elif name == "rewards":
-                    rewards = batch[idx]
-                elif name == "next_observations":
-                    next_states = batch[idx]
-                elif name == "dones":
-                    dones = batch[idx]
-                elif name == "global_states":
-                    global_states = batch[idx]
-                elif name == "next_global_states":
-                    next_global_states = batch[idx]
-                idx += 1
-            
-            # Check that we have all required tensors
-            for required_var in ["states", "actions", "rewards", "next_states", "dones"]:
-                if required_var not in locals():
-                    print(f"Error: Required tensor '{required_var}' not found in sampled batch")
-                    return {}
-            
-            if "global_states" not in locals() or "next_global_states" not in locals():
-                print("Error: Missing global states in sampled batch")
-                return {}
+            states = batch[0]
+            actions = batch[1]
+            rewards = batch[2]
+            next_states = batch[3]
+            dones = batch[4]
+            global_states = batch[5]
+            next_global_states = batch[6]
             
             # Get Q-values for each agent for current observations
             agent_q_values = []
-            target_agent_q_values = []
             chosen_actions_q_values = []
             max_next_q_values = []
             
             for i, agent in enumerate(self.agents):
                 # Get Q-values from main network
-                # Create input dictionary for the Q-network
                 q_inputs = {"states": states[:, i]}  # [batch_size, state_dim]
                 q_values = agent.models["q_network"](q_inputs)[0]  # [batch_size, action_dim]
                 agent_q_values.append(q_values)
@@ -452,6 +240,7 @@ class QMIXAgent(MultiAgent):
             
             # Calculate loss
             loss = F.mse_loss(mixed_q_values, targets.detach())
+            self.loss = loss.item()
             
             # Optimize mixing network
             self.optimizer.zero_grad()
@@ -466,27 +255,8 @@ class QMIXAgent(MultiAgent):
                     agent_info[f"agent_{i}"] = {"skipped": True}
                     continue
                 
-                # Important: Each agent.update() call will:
-                # 1. Sample from the agent's memory (separate from the QMIX memory)
-                # 2. Compute the individual agent's loss (DQN loss)
-                # 3. Perform backpropagation through the agent's Q-network
-                # 4. Update the agent's Q-network parameters using the agent's optimizer
-                try:
-                    agent_update_info = agent.post_interaction(current_step, training_steps)
-                    agent_info[f"agent_{i}"] = agent_update_info
-                    
-                    # Print info about the first agent's update on the first training step
-                    if not self.checked_dqn_updates and i == 0 and self.training_steps == 1:
-                        print("\nDQN Agent Update Details:")
-                        print("  Each agent's Q-network parameters are updated independently through that agent's optimizer")
-                        print("  Updates happen in two separate steps:")
-                        print("    1. The mixing network is updated to better combine individual agent Q-values")
-                        print("    2. Each agent's Q-network is updated independently to learn better individual policies")
-                        print("  This dual update approach allows agents to learn both individual and coordinated strategies")
-                        self.checked_dqn_updates = True
-                except Exception as e:
-                    print(f"Error updating agent {i}: {str(e)}")
-                    agent_info[f"agent_{i}"] = {"error": str(e)}
+                agent_update_info = agent.post_interaction(current_step, training_steps)
+                agent_info[f"agent_{i}"] = agent_update_info
             
             # Update target mixing network
             if self.training_steps % self.target_update_frequency == 0:
@@ -506,8 +276,7 @@ class QMIXAgent(MultiAgent):
             return info
             
         except Exception as e:
-            print(f"Error during update: {e}")
-            raise e
+            logging.error(f"Error during update: {e}")
             return {}
 
     def update_target_networks(self):
@@ -516,248 +285,88 @@ class QMIXAgent(MultiAgent):
             self.agents[i].models["q_network"].update_target_network()
 
 
-# Custom Memory for QMIX
-class QMIXMemory(RandomMemory):
-    """
-    Memory class for QMIX algorithm that stores global states along with agent observations.
-    Uses SKRL's tensor management system properly for optimal performance.
-    """
-    def __init__(self, memory_size, num_agents, device="cpu"):
-        """
-        Initialize the QMIX memory.
-        
-        Args:
-            memory_size: Maximum size of the replay buffer
-            num_agents: Number of agents in the environment
-            device: Device to use for computation ("cpu" or "cuda:X")
-        """
-        # Initialize parent class
-        super().__init__(memory_size=memory_size, device=device)
-        self.num_agents = num_agents
-        
-        print(f"Initializing QMIXMemory for {num_agents} agents with size {memory_size}")
-        
-        # We will directly add global states as tensors in the RandomMemory storage
-        # This approach keeps everything in one place and leverages SKRL's memory management
-        # The standard tensors (observations, actions, rewards, next_observations, dones)
-        # are already handled by RandomMemory
-    
-    def add_samples(self, observations=None, actions=None, rewards=None, next_observations=None, 
-                   dones=None, global_states=None, next_global_states=None):
-        """
-        Add samples to the replay buffer, including global states.
-        
-        Args:
-            observations: Agent observations [batch_size, num_agents, obs_dim]
-            actions: Agent actions [batch_size, num_agents]
-            rewards: Agent rewards [batch_size, num_agents] 
-            next_observations: Next agent observations [batch_size, num_agents, obs_dim]
-            dones: Done flags [batch_size, num_agents]
-            global_states: Global state [batch_size, global_state_dim]
-            next_global_states: Next global state [batch_size, global_state_dim]
-        """
-        # First, we need to ensure global_states tensors exist in memory
-        if "global_states" not in self.tensors and global_states is not None:
-            tensor_shape = (self.memory_size,) + tuple(global_states.shape[1:])
-            self.tensors["global_states"] = torch.zeros(tensor_shape, dtype=torch.float32, device=self.device)
-            print(f"Created 'global_states' tensor with shape {tensor_shape}")
-            
-        if "next_global_states" not in self.tensors and next_global_states is not None:
-            tensor_shape = (self.memory_size,) + tuple(next_global_states.shape[1:])
-            self.tensors["next_global_states"] = torch.zeros(tensor_shape, dtype=torch.float32, device=self.device)
-            print(f"Created 'next_global_states' tensor with shape {tensor_shape}")
-        
-        # Next, we need to determine batch size
-        batch_size = 0
-        if observations is not None:
-            batch_size = observations.shape[0]
-        elif actions is not None:
-            batch_size = actions.shape[0]
-        elif rewards is not None:
-            batch_size = rewards.shape[0]
-        elif global_states is not None:
-            batch_size = global_states.shape[0]
-        
-        if batch_size == 0:
-            return
-            
-        # Calculate indices for this insertion (circular buffer)
-        indices = torch.arange(self.memory_index, self.memory_index + batch_size) % self.memory_size
-        
-        # Store all tensors directly in self.tensors
-        if observations is not None:
-            # Handle observations (potentially)
-            self._maybe_create_tensor("observations", observations, batch_size)
-            self.tensors["observations"][indices] = observations
-            
-        if actions is not None:
-            self._maybe_create_tensor("actions", actions, batch_size)
-            self.tensors["actions"][indices] = actions
-            
-        if rewards is not None:
-            self._maybe_create_tensor("rewards", rewards, batch_size)
-            self.tensors["rewards"][indices] = rewards
-            
-        if next_observations is not None:
-            self._maybe_create_tensor("next_observations", next_observations, batch_size)
-            self.tensors["next_observations"][indices] = next_observations
-            
-        if dones is not None:
-            self._maybe_create_tensor("dones", dones, batch_size)
-            self.tensors["dones"][indices] = dones
-            
-        if global_states is not None and "global_states" in self.tensors:
-            self.tensors["global_states"][indices] = global_states
-            
-        if next_global_states is not None and "next_global_states" in self.tensors:
-            self.tensors["next_global_states"][indices] = next_global_states
-        
-        # Update indices
-        prev_index = self.memory_index
-        self.memory_index = (self.memory_index + batch_size) % self.memory_size
-        
-        # Update filled size
-        if self.memory_index <= prev_index:  # We've wrapped around
-            self.filled = self.memory_size
-        else:
-            self.filled = max(self.filled, self.memory_index)
-    
-    def _maybe_create_tensor(self, name, tensor, batch_size):
-        """Create a tensor in memory if it doesn't already exist."""
-        if name not in self.tensors:
-            shape = (self.memory_size,) + tuple(tensor.shape[1:])
-            self.tensors[name] = torch.zeros(shape, dtype=tensor.dtype, device=self.device)
-            print(f"Created '{name}' tensor with shape {shape}")
-        
-    def sample(self, names, batch_size, mini_batches=1):
-        """
-        Sample a batch of experiences from memory.
-        
-        Args:
-            names: Tuple of tensor names to sample
-            batch_size: Number of samples to retrieve
-            mini_batches: Number of mini-batches
-            
-        Returns:
-            List of sampled tensors
-        """
-        if not hasattr(self, '_printed_tensors'):
-            print(f"QMIXMemory available tensors: {list(self.tensors.keys())}")
-            print(f"QMIXMemory filled: {self.filled}/{self.memory_size}")
-            self._printed_tensors = True
-            
-        # Check if we have enough samples
-        if self.filled < batch_size:
-            raise RuntimeError(f"Not enough samples in memory. Have {self.filled}, requested {batch_size}")
-            
-        # Generate random indices within the filled portion of memory
-        indices = torch.randint(0, self.filled, (batch_size,), device=self.device)
-        
-        # Sample tensors
-        tensors = []
-        for name in names:
-            if name in self.tensors:
-                tensors.append(self.tensors[name][indices])
-            else:
-                raise KeyError(f"Tensor '{name}' not found in memory. Available tensors: {list(self.tensors.keys())}")
-                
-        # Return as a list of lists (for mini-batches compatibility)
-        return [tensors]
-
-
-# Replace the existing QNetwork class with the one from dqn.py
+# Q-Network for individual agents
 class QNetwork(DeterministicMixin, Model):
-    def __init__(self, observation_dim, action_dim):
-        Model.__init__(self, observation_space=gym.spaces.Box(low=-np.inf, high=np.inf, shape=(observation_dim,)), 
+    def __init__(self, observation_dim, action_dim, hidden_size=128):
+        Model.__init__(self, 
+                      observation_space=gym.spaces.Box(low=-np.inf, high=np.inf, shape=(observation_dim,)), 
                       action_space=gym.spaces.Discrete(action_dim))
         DeterministicMixin.__init__(self, clip_actions=False)
         
         # Network architecture
         self.layers = nn.Sequential(
-            nn.Linear(observation_dim, 128),
+            nn.Linear(observation_dim, hidden_size),
             nn.ReLU(),
-            nn.Linear(128, 128),
+            nn.Linear(hidden_size, hidden_size),
             nn.ReLU(),
-            nn.Linear(128, action_dim)
+            nn.Linear(hidden_size, action_dim)
         )
         
-        # Store target network parameters
+        # Target network
         self.target_layers = copy.deepcopy(self.layers)
         for param in self.target_layers.parameters():
             param.requires_grad = False
     
     def compute(self, inputs, role="q_network"):
-        """
-        Compute Q-values for given states.
-        
-        Args:
-            inputs: Dictionary containing "states" tensor of shape [batch_size, state_dim]
-            role: Which network to use ("q_network" or "target_q_network")
-            
-        Returns:
-            q_values: Tensor of shape [batch_size, action_dim]
-            info: Empty dictionary
-        """
-        # Get states from inputs dictionary and ensure it's float32
+        """Compute Q-values for given states."""
         states = inputs["states"].float()
-        
-        # Print debug info on first forward pass
-        if not hasattr(self, '_printed_shapes'):
-            print(f"QNetwork compute: states shape={states.shape}")
-            self._printed_shapes = True
-        
-        # Forward pass through appropriate network
-        if role == "target_q_network":
-            return self.target_layers(states), {}
-        return self.layers(states), {}
+        return (self.target_layers(states) if role == "target_q_network" else self.layers(states), {})
     
     def update_target_network(self):
         """Update target network parameters"""
         self.target_layers.load_state_dict(self.layers.state_dict())
 
 
-# Add metrics logging functionality
-def log_metrics(metrics, episode, log_dir=None):
-    """
-    Log metrics about the maze solving process.
+# Custom Memory for QMIX
+class QMIXMemory(RandomMemory):
+    """Memory class for QMIX algorithm that stores global states along with agent observations."""
+    def __init__(self, memory_size, num_agents, device="cpu"):
+        super().__init__(memory_size=memory_size, device=device)
+        self.num_agents = num_agents
     
-    Args:
-        metrics: Dictionary containing metrics to log
-        episode: Current episode number
-        log_dir: Directory to save metrics (if None, just print)
-    """
-    # Print current metrics
-    print(f"\nEpisode {episode} Metrics:")
-    print(f"  Total steps: {metrics.get('total_steps', 'N/A')}")
-    print(f"  Total revisits: {metrics.get('total_revisits', 'N/A')}")
-    print(f"  Unique states visited: {metrics.get('unique_states_visited', 'N/A')}")
-    print(f"  Exploration percentage: {metrics.get('exploration_percentage', 'N/A'):.2f}%")
+    def _ensure_tensor_exists(self, name, tensor):
+        if name not in self.tensors and tensor is not None:
+            shape = (self.memory_size,) + tuple(tensor.shape[1:])
+            self.tensors[name] = torch.zeros(shape, dtype=tensor.dtype, device=self.device)
     
-    if metrics.get('maze_solved', False):
-        print(f"  Maze solved in {metrics.get('steps_to_solve', 'N/A')} steps")
-    else:
-        print("  Maze not solved yet")
+    def add_samples(self, observations=None, actions=None, rewards=None, next_observations=None, 
+                   dones=None, global_states=None, next_global_states=None):
+        # Ensure tensors exist
+        self._ensure_tensor_exists("global_states", global_states)
+        self._ensure_tensor_exists("next_global_states", next_global_states)
+        
+        # Get batch size from first non-None input
+        batch_size = next((x.shape[0] for x in [observations, actions, rewards, global_states] if x is not None), 0)
+        if batch_size == 0:
+            return
+            
+        # Calculate indices
+        indices = torch.arange(self.memory_index, self.memory_index + batch_size) % self.memory_size
+        
+        # Store all tensors
+        for name, tensor in [
+            ("observations", observations),
+            ("actions", actions),
+            ("rewards", rewards),
+            ("next_observations", next_observations),
+            ("dones", dones),
+            ("global_states", global_states),
+            ("next_global_states", next_global_states)
+        ]:
+            if tensor is not None and name in self.tensors:
+                self.tensors[name][indices] = tensor
+        
+        # Update indices and filled size
+        prev_index = self.memory_index
+        self.memory_index = (self.memory_index + batch_size) % self.memory_size
+        self.filled = self.memory_size if self.memory_index <= prev_index else max(self.filled, self.memory_index)
     
-    # Save metrics to file if log_dir is provided
-    if log_dir is not None:
-        import os
-        import json
-        from datetime import datetime
-        
-        # Create log directory if it doesn't exist
-        os.makedirs(log_dir, exist_ok=True)
-        
-        # Create filename with timestamp
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = os.path.join(log_dir, f"metrics_{timestamp}.json")
-        
-        # Add episode number to metrics
-        metrics_with_episode = metrics.copy()
-        metrics_with_episode['episode'] = episode
-        
-        # Write metrics to file
-        with open(filename, 'w') as f:
-            json.dump(metrics_with_episode, f)
+    def sample(self, names, batch_size, mini_batches=1):
+        if self.filled < batch_size:
+            raise RuntimeError(f"Not enough samples in memory. Have {self.filled}, requested {batch_size}")
+            
+        indices = torch.randint(0, self.filled, (batch_size,), device=self.device)
+        return [[self.tensors[name][indices] for name in names if name in self.tensors]]
 
 
 def get_global_state(info, maze_size, global_state_dim):
@@ -775,6 +384,371 @@ def get_global_state(info, maze_size, global_state_dim):
     else:
         # Fallback to a zero vector
         return np.zeros(global_state_dim, dtype=np.float32)
+
+
+def plot_training_metrics(log_dir, save_path=None, metrics_file="metrics.csv"):
+    """
+    Plot training metrics from CSV data with improved visualization.
+    Displays: rewards, training loss, maze exploration, and completion metrics.
+    
+    Args:
+        log_dir: Directory containing the metrics CSV file
+        save_path: Optional path to save the plot
+        metrics_file: Filename of the metrics CSV
+    """
+    metrics_path = os.path.join(log_dir, metrics_file)
+    if not os.path.exists(metrics_path):
+        logging.error(f"Metrics file not found at {metrics_path}")
+        return
+    
+    # Try to read metrics from CSV first
+    try:
+        df = pd.read_csv(metrics_path)
+        if df.empty:
+            logging.error("Metrics file is empty")
+            return
+        logging.info(f"Loaded {len(df)} data points from CSV")
+    except Exception as e:
+        logging.error(f"Error loading CSV metrics: {e}")
+        return
+    
+    # Also try to read tensorboard logs if available
+    tb_metrics = {}
+    try:
+        # Import here so it's optional
+        from tensorboard.backend.event_processing import event_accumulator
+        
+        # Find the most recent events file
+        events_files = sorted(Path(log_dir).glob("events.out.tfevents.*"), 
+                           key=lambda x: x.stat().st_mtime, reverse=True)
+        if events_files:
+            events_file = str(events_files[0])
+            logging.info(f"Found tensorboard events file: {events_file}")
+            
+            # Load the events
+            ea = event_accumulator.EventAccumulator(events_file)
+            ea.Reload()
+            
+            # Extract metrics from tensorboard
+            for tag in ea.Tags()['scalars']:
+                events = ea.Scalars(tag)
+                if events:
+                    tb_metrics[tag] = np.array([(x.step, x.value) for x in events])
+                    logging.info(f"Loaded {len(events)} points for {tag}")
+    except (ImportError, Exception) as e:
+        logging.warning(f"Could not load tensorboard metrics: {e}")
+    
+    # Set up the figure with a clean style
+    plt.style.use('seaborn-v0_8-whitegrid')
+    plt.rcParams.update({
+        'font.size': 10,
+        'axes.titlesize': 12,
+        'axes.labelsize': 10,
+        'xtick.labelsize': 9,
+        'ytick.labelsize': 9,
+        'legend.fontsize': 9,
+        'lines.linewidth': 1.5,
+    })
+    
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    fig.suptitle('QMIX Training Metrics', fontsize=16, fontweight='bold')
+    
+    # Define colors for consistency
+    colors = {
+        'reward': '#1f77b4',      # Blue
+        'reward_avg': '#ff7f0e',  # Orange
+        'loss': '#d62728',        # Red
+        'loss_avg': '#e377c2',    # Pink
+        'exploration': '#9467bd', # Purple
+        'success': '#2ca02c',     # Green
+        'revisits': '#8c564b',    # Brown
+        'steps': '#17becf',       # Cyan
+        'q_value': '#7f7f7f',     # Gray
+    }
+    
+    # Pre-process data
+    # Sort by episode/total_steps for consistent plotting
+    df = df.sort_values('total_steps')
+    
+    # Calculate moving averages with adaptive window sizes
+    window_size = max(1, min(20, len(df) // 10))  # Adaptive window size
+    
+    # 1. Plot Episode Rewards
+    ax = axes[0, 0]
+    if 'episode_reward' in df.columns:
+        # Scatter plot for individual rewards
+        ax.scatter(df['total_steps'], df['episode_reward'], 
+                  color=colors['reward'], alpha=0.3, s=15, label='Episode Reward')
+        
+        # Plot moving average
+        rewards_ma = df['episode_reward'].rolling(window=window_size, min_periods=1).mean()
+        ax.plot(df['total_steps'], rewards_ma, 
+               color=colors['reward_avg'], linewidth=2, label=f'{window_size}-ep Moving Avg')
+        
+        # Set reasonable y-limits
+        reward_min = df['episode_reward'].min()
+        reward_max = df['episode_reward'].max()
+        y_margin = max(1, (reward_max - reward_min) * 0.1)
+        ax.set_ylim(reward_min - y_margin, reward_max + y_margin)
+        
+        # Also check tensorboard for reward data
+        if 'rewards/episode_reward' in tb_metrics:
+            steps, values = tb_metrics['rewards/episode_reward'].T
+            # Only plot if not duplicate of CSV data
+            if len(steps) > len(df) or not np.array_equal(steps, df['total_steps']):
+                logging.info("Using reward data from tensorboard")
+                ax.plot(steps, pd.Series(values).rolling(window=window_size, min_periods=1).mean(), 
+                      'g--', linewidth=1.5, alpha=0.7, label='TB Rewards (MA)')
+    else:
+        ax.text(0.5, 0.5, 'No reward data available', 
+              ha='center', va='center', transform=ax.transAxes, fontsize=12)
+    
+    ax.set_title('Episode Rewards', fontweight='bold')
+    ax.set_xlabel('Training Steps')
+    ax.set_ylabel('Reward')
+    ax.legend(loc='best', frameon=True)
+    ax.grid(True, alpha=0.3)
+    
+    # 2. Plot Training Loss and Q-values
+    ax = axes[0, 1]
+    
+    # Plot loss values
+    if False and 'loss' in df.columns and not df['loss'].isna().all():
+        # Handle any extreme values
+        df['loss'] = df['loss'].replace([np.inf, -np.inf], np.nan)
+        if df['loss'].max() > 1000:  # If losses are unusually high
+            df['loss'] = df['loss'].clip(upper=df['loss'].quantile(0.95))  # Clip to 95th percentile
+        
+        # Plot individual loss values 
+        ax.scatter(df['total_steps'], df['loss'], 
+                 color=colors['loss'], alpha=0.2, s=10, label='Loss')
+        
+        # Plot moving average
+        loss_ma = df['loss'].rolling(window=window_size, min_periods=1).mean()
+        ax.plot(df['total_steps'], loss_ma, 
+              color=colors['loss_avg'], linewidth=2, label=f'Loss {window_size}-ep MA')
+        
+        # Set reasonable y-limits
+        loss_min = df['loss'].min()
+        loss_max = df['loss'].max()
+        y_margin = max(0.1, (loss_max - loss_min) * 0.1)
+        ax.set_ylim(max(0, loss_min - y_margin), loss_max + y_margin)
+    elif 'charts/Q-network loss' in tb_metrics:
+        steps, values = tb_metrics['charts/Q-network loss'].T
+        ax.plot(steps, values, color=colors['loss'], alpha=0.3, label='Loss (TB)')
+        ax.plot(steps, pd.Series(values).rolling(window=window_size, min_periods=1).mean(), 
+              color=colors['loss_avg'], linewidth=2, label=f'Loss {window_size}-ep MA')
+    else:
+        ax.text(0.5, 0.5, 'No loss data available', 
+              ha='center', va='center', transform=ax.transAxes, fontsize=12)
+    
+    # Add Q-values on the same plot with twin y-axis if available
+    if 'q_values' in df.columns and not df['q_values'].isna().all() and df['q_values'].max() > 0:
+        ax2 = ax.twinx()
+        q_ma = df['q_values'].rolling(window=window_size, min_periods=1).mean()
+        ax2.plot(df['total_steps'], q_ma, 
+               color=colors['q_value'], linewidth=2, label='Q-value (MA)')
+        ax2.set_ylabel('Average Q-value', color=colors['q_value'])
+        ax2.tick_params(axis='y', labelcolor=colors['q_value'])
+        
+        # Add legend for both axes
+        lines1, labels1 = ax.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax.legend(lines1 + lines2, labels1 + labels2, loc='best', frameon=True)
+    elif 'charts/q_values' in tb_metrics:
+        ax2 = ax.twinx()
+        steps, values = tb_metrics['charts/q_values'].T
+        q_ma = pd.Series(values).rolling(window=window_size, min_periods=1).mean()
+        ax2.plot(steps, q_ma, color=colors['q_value'], linewidth=2, label='Q-value (MA)')
+        ax2.set_ylabel('Average Q-value', color=colors['q_value'])
+        ax2.tick_params(axis='y', labelcolor=colors['q_value'])
+        
+        # Add legend for both axes
+        lines1, labels1 = ax.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax.legend(lines1 + lines2, labels1 + labels2, loc='best', frameon=True)
+    else:
+        ax.legend(loc='best', frameon=True)
+    
+    ax.set_title('Training Loss & Q-values', fontweight='bold')
+    ax.set_xlabel('Training Steps')
+    ax.set_ylabel('Loss')
+    ax.grid(True, alpha=0.3)
+    
+    # 3. Plot Maze Exploration and Success Rate
+    ax = axes[1, 0]
+    if 'exploration_percentage' in df.columns:
+        # Create light area fill for exploration
+        ax.fill_between(df['total_steps'], 0, df['exploration_percentage'], 
+                       color=colors['exploration'], alpha=0.2)
+        
+        # Plot exploration line
+        ax.plot(df['total_steps'], df['exploration_percentage'], 
+               color=colors['exploration'], linewidth=2, label='Exploration %')
+        
+        # Add success rate on same axis
+        if 'success_rate' in df.columns:
+            ax.plot(df['total_steps'], df['success_rate'], 
+                   color=colors['success'], linewidth=2, label='Success Rate (%)')
+        elif 'maze_solved' in df.columns:
+            # Calculate success rate from maze_solved
+            df['cum_success'] = df['maze_solved'].cumsum()
+            df['success_rate'] = 100 * df['cum_success'] / (df.index + 1)
+            ax.plot(df['total_steps'], df['success_rate'], 
+                   color=colors['success'], linewidth=2, label='Success Rate (%)')
+        
+        # Add a line at 100% for reference
+        ax.axhline(y=100, color='gray', linestyle='--', alpha=0.5)
+        
+        ax.set_ylim(0, 105)  # Percentage scale with small margin
+    elif 'exploration/percentage' in tb_metrics:
+        steps, values = tb_metrics['exploration/percentage'].T
+        ax.fill_between(steps, 0, values, color=colors['exploration'], alpha=0.2)
+        ax.plot(steps, values, color=colors['exploration'], linewidth=2, label='Exploration %')
+        
+        # Try to get success rate from tensorboard
+        if 'metrics/success_rate' in tb_metrics:
+            steps_success, values_success = tb_metrics['metrics/success_rate'].T
+            ax.plot(steps_success, values_success, 
+                   color=colors['success'], linewidth=2, label='Success Rate (%)')
+        
+        ax.axhline(y=100, color='gray', linestyle='--', alpha=0.5)
+        ax.set_ylim(0, 105)
+    else:
+        ax.text(0.5, 0.5, 'No exploration data available', 
+              ha='center', va='center', transform=ax.transAxes, fontsize=12)
+        
+    ax.set_title('Maze Exploration & Success Rate', fontweight='bold')
+    ax.set_xlabel('Training Steps')
+    ax.set_ylabel('Percentage (%)')
+    ax.legend(loc='best', frameon=True)
+    ax.grid(True, alpha=0.3)
+    
+    # 4. Plot Completion Metrics (Revisits and Steps to Solve)
+    ax = axes[1, 1]
+    
+    # Create second y-axis for steps to solve
+    ax2 = ax.twinx() if 'steps_to_solve' in df.columns else None
+    
+    # Plot revisits
+    if 'total_revisits' in df.columns:
+        # Scatter for raw data
+        ax.scatter(df['total_steps'], df['total_revisits'], 
+                 color=colors['revisits'], alpha=0.2, s=10, label='Revisits')
+                
+        # Moving average for trend
+        revisits_ma = df['total_revisits'].rolling(window=window_size, min_periods=1).mean()
+        ax.plot(df['total_steps'], revisits_ma, 
+              color=colors['revisits'], linewidth=2, label=f'Revisits ({window_size}-ep MA)')
+        
+        ax.set_ylabel('Number of Revisits', color=colors['revisits'])
+        ax.tick_params(axis='y', labelcolor=colors['revisits'])
+    elif 'metrics/revisits' in tb_metrics:
+        steps, values = tb_metrics['metrics/revisits'].T
+        ax.scatter(steps, values, color=colors['revisits'], alpha=0.2, s=10, label='Revisits')
+        revisits_ma = pd.Series(values).rolling(window=window_size, min_periods=1).mean()
+        ax.plot(steps, revisits_ma, color=colors['revisits'], linewidth=2, 
+               label=f'Revisits ({window_size}-ep MA)')
+        
+        ax.set_ylabel('Number of Revisits', color=colors['revisits'])
+        ax.tick_params(axis='y', labelcolor=colors['revisits'])
+    
+    # Plot steps to solve
+    if 'steps_to_solve' in df.columns and ax2 is not None:
+        # Get only solved episodes (steps_to_solve >= 0)
+        solved_df = df[df['steps_to_solve'] >= 0]
+        
+        if not solved_df.empty:
+            # Plot individual steps to solve
+            ax2.scatter(solved_df['total_steps'], solved_df['steps_to_solve'], 
+                      color=colors['steps'], alpha=0.5, s=20, label='Steps to Solve')
+            
+            # Plot moving average if we have enough solved episodes
+            if len(solved_df) >= 3:
+                steps_window = min(len(solved_df) // 2, 10)
+                steps_ma = solved_df['steps_to_solve'].rolling(window=steps_window, min_periods=1).mean()
+                ax2.plot(solved_df['total_steps'], steps_ma, 
+                       color=colors['steps'], linewidth=2, label=f'Steps ({steps_window}-ep MA)')
+            
+            ax2.set_ylabel('Steps to Solve', color=colors['steps'])
+            ax2.tick_params(axis='y', labelcolor=colors['steps'])
+            
+            # Set reasonable y-limits
+            steps_max = solved_df['steps_to_solve'].max()
+            ax2.set_ylim(0, steps_max * 1.1)
+    elif 'metrics/steps_to_solve' in tb_metrics and ax2 is None:
+        ax2 = ax.twinx()
+        steps, values = tb_metrics['metrics/steps_to_solve'].T
+        
+        # Filter out any negative values (unsuccessful episodes)
+        mask = values >= 0
+        if np.any(mask):
+            steps_filtered = steps[mask]
+            values_filtered = values[mask]
+            
+            ax2.scatter(steps_filtered, values_filtered, 
+                       color=colors['steps'], alpha=0.5, s=20, label='Steps to Solve')
+            
+            if len(steps_filtered) >= 3:
+                steps_ma = pd.Series(values_filtered).rolling(window=min(5, len(steps_filtered)//2), min_periods=1).mean()
+                ax2.plot(steps_filtered, steps_ma, 
+                       color=colors['steps'], linewidth=2, label='Steps (MA)')
+            
+            ax2.set_ylabel('Steps to Solve', color=colors['steps'])
+            ax2.tick_params(axis='y', labelcolor=colors['steps'])
+    
+    # If we have neither revisits nor steps data
+    if ('total_revisits' not in df.columns and 'metrics/revisits' not in tb_metrics and 
+        'steps_to_solve' not in df.columns and 'metrics/steps_to_solve' not in tb_metrics):
+        ax.text(0.5, 0.5, 'No completion metrics available', 
+              ha='center', va='center', transform=ax.transAxes, fontsize=12)
+    
+    ax.set_title('Maze Completion Metrics', fontweight='bold')
+    ax.set_xlabel('Training Steps')
+    ax.grid(True, alpha=0.3)
+    
+    # Add legend for both axes if needed
+    if ax2 is not None:
+        handles1, labels1 = ax.get_legend_handles_labels()
+        handles2, labels2 = ax2.get_legend_handles_labels()
+        ax.legend(handles1 + handles2, labels1 + labels2, loc='best', frameon=True)
+    else:
+        ax.legend(loc='best', frameon=True)
+    
+    # Add a overall caption with key information
+    try:
+        # Get config if available
+        config_path = os.path.join(log_dir, "config.json")
+        if os.path.exists(config_path):
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+            
+            # Create config text
+            config_text = (
+                f"Maze: {config.get('maze_size', 'N/A')}×{config.get('maze_size', 'N/A')}, "
+                f"Agents: {config.get('num_agents', 'N/A')}, "
+                f"Obs: {config.get('observation_type', 'N/A')}, "
+                f"LR: {config.get('learning_rate', 'N/A')}, "
+                f"Batch: {config.get('batch_size', 'N/A')}"
+            )
+            
+            fig.text(0.5, 0.01, config_text, ha='center', fontsize=10, 
+                    bbox=dict(facecolor='white', alpha=0.5, boxstyle='round,pad=0.5'))
+    except Exception as e:
+        logging.warning(f"Could not add config caption: {e}")
+    
+    # Adjust layout
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    
+    # Save plot
+    if save_path is None:
+        save_path = os.path.join(log_dir, "training_metrics.png")
+    
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    logging.info(f"Saved metrics plot to {save_path}")
+    plt.close()
+    
+    return save_path
 
 
 def train_qmix(
@@ -795,30 +769,14 @@ def train_qmix(
     log_every=10,
     seed=42,
     experiment_name=None,
-    learning_starts=1000
+    learning_starts=1000,
+    obs_type="full",
+    pob_size=1,
+    obstacle_ratio=0.1,
+    log_dir=None
 ):
     """
     Train a QMIX agent to solve a maze.
-    
-    Args:
-        maze_size: Integer specifying the size of the maze
-        num_agents: Number of agents to use
-        memory_size: Size of the replay buffer
-        learning_rate: Learning rate for optimizer
-        training_steps: Total number of training steps
-        batch_size: Batch size for training
-        gamma: Discount factor
-        target_update_frequency: How often to update target network
-        agent_update_frequency: How often to update agent networks
-        tau: Interpolation parameter for target network update
-        initial_epsilon: Initial exploration rate
-        final_epsilon: Final exploration rate
-        epsilon_steps: Number of steps to decay epsilon over
-        exploration_percentage_threshold: Stop training if exploration percentage exceeds this value
-        log_every: How often to log metrics (in episodes)
-        seed: Random seed
-        experiment_name: Name for the experiment (for logging)
-        learning_starts: Number of steps before starting to learn
     """
     # Set random seed for reproducibility
     np.random.seed(seed)
@@ -826,93 +784,133 @@ def train_qmix(
     
     # Create experiment name with timestamp if not provided
     if experiment_name is None:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        experiment_name = f"qmix_maze_{maze_size}x{maze_size}_agents{num_agents}_{timestamp}"
+        timestamp = int(time.time())
+        experiment_name = f"qmix_maze_{num_agents}_{timestamp}"
     
     # Create logging directory
-    log_dir = os.path.join("logs", experiment_name)
+    if log_dir is None:
+        log_dir = os.path.join("logs", experiment_name)
     os.makedirs(log_dir, exist_ok=True)
     
-    print(f"Starting QMIX training for {training_steps} steps")
-    print(f"Experiment: {experiment_name}")
-    print(f"Log directory: {log_dir}")
+    # Set up logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(os.path.join(log_dir, "train.log")),
+            logging.StreamHandler()
+        ]
+    )
+    logger = logging.getLogger(__name__)
+    
+    logger.info(f"Starting QMIX training for {training_steps} steps")
+    logger.info(f"Experiment: {experiment_name}")
+    logger.info(f"Log directory: {log_dir}")
+    logger.info(f"Training with {num_agents} agents in a {maze_size}x{maze_size} maze")
+    logger.info(f"Observation type: {obs_type}, POB size: {pob_size}")
+    
+    # Setup tensorboard writer
+    from torch.utils.tensorboard import SummaryWriter
+    writer = SummaryWriter(log_dir)
+    
+    # Save configuration info to tensorboard
+    config = {
+        'maze_size': maze_size,
+        'num_agents': num_agents,
+        'observation_type': obs_type,
+        'pob_size': pob_size,
+        'learning_rate': learning_rate,
+        'batch_size': batch_size,
+        'gamma': gamma,
+        'memory_size': memory_size,
+        'target_update_frequency': target_update_frequency,
+        'agent_update_frequency': agent_update_frequency,
+        'training_steps': training_steps,
+        'seed': seed,
+        'exploration': {
+            'initial_epsilon': initial_epsilon,
+            'final_epsilon': final_epsilon,
+            'timesteps': epsilon_steps
+        },
+        'exploration_threshold': exploration_percentage_threshold,
+    }
+    
+    # Log hyperparameters to TensorBoard
+    writer.add_text("hyperparameters", str(config))
+    
+    # Also save as JSON for reference
+    with open(os.path.join(log_dir, "config.json"), "w") as f:
+        json.dump(config, f, indent=4)
     
     # Create multi-agent maze environment
     env = MazeEnv(
         maze_generator=RandomBlockMazeGenerator(
             maze_size=maze_size,
-            obstacle_ratio=0.1,
+            obstacle_ratio=obstacle_ratio,
         ),
-        pob_size=1,  # Default partial observation size
-        action_type='VonNeumann',  # Default action type
-        obs_type='full',  # Use full observations
-        live_display=False,  # Don't show live display during training
-        render_trace=True  # Track agent paths
+        pob_size=pob_size,
+        action_type='VonNeumann',
+        obs_type=obs_type,
+        live_display=False,
+        render_trace=True
     )
     
     # Reset the environment to get initial observation shapes
     observations, info = env.reset(num_agents=num_agents, seed=seed)
     
     # Get observation dimensions
-    obs_dim = observations[0].shape[0]  # Get the dimension of a single agent's observation
+    obs_dim = observations[0].shape[0]
     action_dim = env.action_space.n
     
-    print(f"Observation dimension: {obs_dim}, Action dimension: {action_dim}")
+    logger.info(f"Observation dimension: {obs_dim}, Action dimension: {action_dim}")
     
-    # Create individual agent models with correct input dimensions
+    # Create individual agent models
     agent_models = []
     for i in range(num_agents):
         models = {}
-        models["q_network"] = QNetwork(
-            observation_dim=obs_dim, 
-            action_dim=action_dim
-        )
-        models["target_q_network"] = QNetwork(
-            observation_dim=obs_dim, 
-            action_dim=action_dim
-        )
+        models["q_network"] = QNetwork(obs_dim, action_dim)
+        models["target_q_network"] = QNetwork(obs_dim, action_dim)
         # Copy target network weights from main network
         models["target_q_network"].load_state_dict(models["q_network"].state_dict())
         agent_models.append(models)
     
     # Determine global state dimension
     if hasattr(env.unwrapped, '_get_full_obs'):
-        # Use the full observation as a global state
         full_obs = env.unwrapped._get_full_obs()
         global_state_dim = full_obs.flatten().shape[0]
     else:
-        # Fallback to a reasonable size if no global state is available
         global_state_dim = maze_size * maze_size * 3
     
-    print(f"Global state dimension: {global_state_dim}")
+    logger.info(f"Global state dimension: {global_state_dim}")
     
-    # Create mixing network with correct global state dimension
+    # Create mixing network
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
     mixing_network = MixingNetwork(
         observation_space=gym.spaces.Box(low=-np.inf, high=np.inf, shape=(global_state_dim,)),
         action_space=env.action_space,
-        device="cuda:0" if torch.cuda.is_available() else "cpu",
+        device=device,
         num_agents=num_agents,
         mixing_embed_dim=32,
         hypernet_embed=64
     )
     
-    # Create replay memory for experience replay
+    # Create replay memory
     memory = QMIXMemory(
         memory_size=memory_size,
         num_agents=num_agents,
-        device="cuda:0" if torch.cuda.is_available() else "cpu"
+        device=device
     )
     
     # Create individual DQN agents
     dqn_agents = []
     for i in range(num_agents):
-        agent_memory = RandomMemory(memory_size=memory_size, device="cuda:0" if torch.cuda.is_available() else "cpu")
+        agent_memory = RandomMemory(memory_size=memory_size, device=device)
         
-        # Explicitly initialize the memory tensors
-        dummy_obs = torch.zeros((1, obs_dim), dtype=torch.float32, device="cuda:0" if torch.cuda.is_available() else "cpu")
-        dummy_action = torch.zeros((1,), dtype=torch.long, device="cuda:0" if torch.cuda.is_available() else "cpu")
-        dummy_reward = torch.zeros((1,), dtype=torch.float32, device="cuda:0" if torch.cuda.is_available() else "cpu")
-        dummy_done = torch.zeros((1,), dtype=torch.bool, device="cuda:0" if torch.cuda.is_available() else "cpu")
+        # Initialize the memory tensors
+        dummy_obs = torch.zeros((1, obs_dim), dtype=torch.float32, device=device)
+        dummy_action = torch.zeros((1,), dtype=torch.long, device=device)
+        dummy_reward = torch.zeros((1,), dtype=torch.float32, device=device)
+        dummy_done = torch.zeros((1,), dtype=torch.bool, device=device)
         
         # Initialize the tensors with a dummy sample
         agent_memory.add_samples(
@@ -939,19 +937,8 @@ def train_qmix(
             },
             observation_space=gym.spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,)),
             action_space=env.action_space,
-            device="cuda:0" if torch.cuda.is_available() else "cpu"
+            device=device
         )
-        # Set required attributes for DQN agent
-        dqn_agent.tensors_names = ["observations", "actions", "rewards", "next_observations", "dones"]
-        dqn_agent._batch_size = batch_size
-        dqn_agent._learning_rate = learning_rate
-        dqn_agent._gamma = gamma
-        dqn_agent._target_update_frequency = target_update_frequency
-        dqn_agent._exploration = {
-            "initial_epsilon": initial_epsilon,
-            "final_epsilon": final_epsilon,
-            "timesteps": epsilon_steps
-        }
         dqn_agents.append(dqn_agent)
     
     # Create QMIX agent
@@ -969,7 +956,7 @@ def train_qmix(
         },
         observation_space=gym.spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,)),
         action_space=env.action_space,
-        device="cuda:0" if torch.cuda.is_available() else "cpu"
+        device=device
     )
     
     # Start training loop
@@ -977,9 +964,15 @@ def train_qmix(
     current_step = 0
     start_time = time.time()
     
-    # Variables to track exploration metrics
+    # Tracking variables
     total_solved = 0
     total_episodes = 0
+    best_exploration = 0
+    best_reward = float('-inf')
+    
+    # Create progress bar
+    from tqdm import tqdm
+    pbar = tqdm(total=training_steps, desc="Training")
     
     # Main training loop
     while current_step < training_steps:
@@ -997,24 +990,19 @@ def train_qmix(
         episode_step = 0
         episode_reward = 0
         episode_done = False
-        last_actions = []
+        episode_loss = 0
+        episode_q_values = 0
         
         # Safety counter to prevent infinite loops
-        max_episode_safety_limit = 10000
+        max_episode_safety_limit = 2000
         
         # Run episode until it's done (maze is solved) or safety limit reached
         while not episode_done and episode_step < max_episode_safety_limit:
             # Get actions from agent
             actions = agent.act(observations, current_step, training_steps)
-            last_actions = actions.copy()  # Store for logging
             
             # Take a step in the environment
             next_observations, rewards, dones, truncated, info = env.step(actions)
-            
-            # Log detailed reward information
-            if episode_step % 1000 == 0 or sum(rewards) > 0:
-                print(f"  Step {episode_step}, Rewards: {rewards}, Actions: {actions}")
-                print(f"  Current exploration: {info.get('exploration_percentage', 0):.2f}% ({info.get('unique_states_visited', 0)} states)")
             
             # Get next global state
             next_global_state = get_global_state(info, maze_size, global_state_dim)
@@ -1042,113 +1030,156 @@ def train_qmix(
             episode_step += 1
             current_step += 1
             episode_reward += sum(rewards)
+            # if episode_reward < -500:
+            #     episode_done = True
+            #     continue
             episode_done = any(dones) or any(truncated)
+            
+            # Get current exploration percentage and revisits count
+            exploration_percentage = info.get('exploration_percentage', 0)
+            total_revisits = info.get('total_revisits', 0)
+            unique_states_visited = info.get('unique_states_visited', 0)
+            
+            # Log these metrics at each step to show progress over time
+            writer.add_scalar("charts/exploration", exploration_percentage, current_step)
+            writer.add_scalar("charts/revisits", total_revisits, current_step)
+            writer.add_scalar("charts/unique_states", unique_states_visited, current_step)
             
             # Only update the agent if we've collected enough samples
             if current_step >= learning_starts and current_step % agent_update_frequency == 0 and memory.filled >= batch_size:
-                agent.post_interaction(current_step, training_steps)
+                update_info = agent.post_interaction(current_step, training_steps)
+                if 'loss' in update_info:
+                    episode_loss = update_info['loss']
+                    writer.add_scalar("charts/Q-network loss", update_info['loss'], current_step)
             
             # Check if we've reached the training steps limit
             if current_step >= training_steps:
                 break
             
-            # Periodically log progress during episode
-            if current_step % 1000 == 0:
-                print(f"Step {current_step}/{training_steps} - Episode {episode+1} - Step {episode_step}")
-                if current_step < learning_starts:
-                    print(f"  Collecting initial samples: {current_step}/{learning_starts}")
-                else:
-                    print(f"  Training: {current_step - learning_starts}/{training_steps - learning_starts}")
+            # Log agent Q-values and exploration periodically
+            if current_step % 100 == 0:
+                # Log average Q-values across all agents
+                avg_q_values = 0
+                q_count = 0
+                for i, agent_model in enumerate(agent_models):
+                    with torch.no_grad():
+                        # Sample states from the agent's memory
+                        if dqn_agents[i].memory.filled > 0:
+                            states_sample = dqn_agents[i].memory.tensors["observations"][:min(100, dqn_agents[i].memory.filled)]
+                            q_values = agent_model["q_network"].compute({"states": states_sample})[0]
+                            avg_q = q_values.mean().item()
+                            avg_q_values += avg_q
+                            q_count += 1
+                            writer.add_scalar(f"charts/agent_{i}_q_values", avg_q, current_step)
                 
-                # Get tracking metrics from environment
-                if 'total_steps' in info:
-                    exploration_pct = info.get('exploration_percentage', 0)
-                    print(f"  Exploration: {exploration_pct:.2f}% ({info.get('unique_states_visited', 0)} states)")
-                    print(f"  Revisits: {info.get('total_revisits', 0)}")
-                    if info.get('maze_solved', False):
-                        print(f"  Maze solved in {info.get('steps_to_solve', 'N/A')} steps")
-                        
-                # Log memory stats
-                print(f"  Memory filled: {memory.filled}/{memory.memory_size}")
+                if q_count > 0:
+                    episode_q_values = avg_q_values / q_count
+                    writer.add_scalar("charts/q_values", episode_q_values, current_step)
                 
-                # Log recent actions and rewards
-                print(f"  Recent actions: {last_actions}")
-                print(f"  Current episode reward: {episode_reward:.2f}")
-        
-        # Check if episode ended due to safety limit
-        if episode_step >= max_episode_safety_limit:
-            print(f"\nWARNING: Episode {episode+1} terminated after {episode_step} steps (safety limit)")
-            print(f"  Final exploration: {info.get('exploration_percentage', 0):.2f}% ({info.get('unique_states_visited', 0)} states)")
-            print(f"  Final actions: {last_actions}")
+                # Log current exploration epsilon
+                epsilon = max([agent.cfg["exploration"]["final_epsilon"] for agent in dqn_agents]) 
+                if current_step < epsilon_steps:
+                    # Calculate current epsilon based on linear decay
+                    epsilon = initial_epsilon - (initial_epsilon - final_epsilon) * (current_step / epsilon_steps)
+                writer.add_scalar("Exploration / Exploration epsilon", epsilon, current_step)
             
-        # Episode completed - capture metrics
-        total_episodes += 1
+            # Update progress bar
+            pbar.update(1)
+            pbar.set_postfix({
+                "episode": episode,
+                "reward": episode_reward,
+                "steps": episode_step,
+                "explored": f"{exploration_percentage:.1f}%"
+            })
         
-        # Extract metrics from the environment
+        # Handle episode completion
+        total_episodes += 1
         maze_solved = info.get('maze_solved', False)
         if maze_solved:
             total_solved += 1
-            
-        metrics = {
-            'total_steps': info.get('total_steps', episode_step),
-            'total_revisits': info.get('total_revisits', 0),
-            'unique_states_visited': info.get('unique_states_visited', 0),
-            'exploration_percentage': info.get('exploration_percentage', 0),
-            'maze_solved': maze_solved,
-            'steps_to_solve': info.get('steps_to_solve', -1) if maze_solved else -1,
-            'episode_reward': episode_reward,
-            'success_rate': (total_solved / total_episodes) * 100
-        }
+            steps_to_solve = info.get('steps_to_solve', episode_step)
+            writer.add_scalar("charts/steps_to_solve", steps_to_solve, current_step)
+            writer.add_scalar("charts/solved", 1, current_step)  # Binary flag for solving
+        else:
+            writer.add_scalar("charts/solved", 0, current_step)  # Not solved
         
-        # Log metrics every N episodes
+        # Calculate success rate
+        success_rate = (total_solved / total_episodes) * 100
+        
+        # Track best exploration so far
+        if exploration_percentage > best_exploration:
+            best_exploration = exploration_percentage
+        
+        # Track best reward so far
+        if episode_reward > best_reward:
+            best_reward = episode_reward
+        
+        # Log episode-level metrics
+        writer.add_scalar("charts/episode_reward", episode_reward, current_step)
+        writer.add_scalar("charts/episode_length", episode_step, current_step)
+        writer.add_scalar("charts/success_rate", success_rate, current_step)
+        writer.add_scalar("charts/best_exploration", best_exploration, current_step)
+        writer.add_scalar("charts/best_reward", best_reward, current_step)
+        
+        # Log terminal output every N episodes
         if episode % log_every == 0:
             elapsed_time = time.time() - start_time
             
-            # Print metrics
-            print(f"\nEpisode {episode+1} completed after {episode_step} steps")
-            print(f"  Reward: {episode_reward:.2f}")
-            print(f"  Exploration: {metrics['exploration_percentage']:.2f}% ({metrics['unique_states_visited']} states)")
-            print(f"  Success rate: {metrics['success_rate']:.2f}%")
-            print(f"  Time elapsed: {elapsed_time:.2f}s")
-            print(f"  Memory filled: {memory.filled}/{memory.memory_size}")
-            
-            # Write metrics to CSV
-            metrics_file = os.path.join(log_dir, "metrics.csv")
-            write_header = not os.path.exists(metrics_file)
-            with open(metrics_file, "a") as f:
-                if write_header:
-                    f.write("episode,total_steps,total_revisits,unique_states_visited,exploration_percentage,maze_solved,steps_to_solve,time_elapsed\n")
-                f.write(f"{episode+1},{metrics['total_steps']},{metrics['total_revisits']},{metrics['unique_states_visited']},{metrics['exploration_percentage']},{1 if metrics['maze_solved'] else 0},{metrics['steps_to_solve']},{elapsed_time:.2f}\n")
+            logger.info(f"\nEpisode {episode}/{training_steps//max_episode_safety_limit} "
+                        f"({current_step}/{training_steps} steps)")
+            logger.info(f"  Reward: {episode_reward:.2f} (best: {best_reward:.2f})")
+            logger.info(f"  Steps: {episode_step}")
+            logger.info(f"  Exploration: {exploration_percentage:.2f}% (best: {best_exploration:.2f}%)")
+            logger.info(f"  Success Rate: {success_rate:.2f}%")
+            logger.info(f"  Loss: {episode_loss:.4f}")
+            logger.info(f"  Time elapsed: {elapsed_time:.1f}s")
+            logger.info(f"  Unique states: {info.get('unique_states_visited', 0)}")
+            logger.info(f"  Revisits: {total_revisits}")
         
         # Check if we've reached the exploration threshold
-        if metrics['exploration_percentage'] > exploration_percentage_threshold:
-            print(f"\nReached exploration threshold of {exploration_percentage_threshold}%!")
-            print(f"Explored {metrics['unique_states_visited']} states out of {maze_size * maze_size} total")
-            print(f"Training completed after {current_step} steps and {episode+1} episodes")
+        if exploration_percentage > exploration_percentage_threshold:
+            logger.info(f"Reached exploration threshold of {exploration_percentage_threshold}%!")
+            logger.info(f"Explored {info.get('unique_states_visited', 0)} states out of {maze_size * maze_size} total")
+            logger.info(f"Training completed after {current_step} steps and {episode+1} episodes")
             break
         
         # Increment episode counter
         episode += 1
     
+    # Close progress bar
+    pbar.close()
+    
     # Save the trained agent
     model_path = os.path.join(log_dir, "qmix_agent.pt")
-    agent.save(model_path)
-    print(f"Agent saved to {model_path}")
+    torch.save({
+        'mixing_network': mixing_network.state_dict(),
+        'agent_models': [m["q_network"].state_dict() for m in agent_models],
+    }, model_path)
+    logger.info(f"Agent saved to {model_path}")
+    
+    # Close environment and writer
+    env.close()
+    writer.close()
+    
+    # Generate plots using plotting module
+    from plotting import plot_training_metrics
+    plot_path = plot_training_metrics(log_dir)
+    logger.info(f"Training metrics plots saved to: {plot_path}")
     
     # Final metrics
     elapsed_time = time.time() - start_time
-    print(f"\nTraining completed:")
-    print(f"  Total steps: {current_step}")
-    print(f"  Total episodes: {episode}")
-    print(f"  Success rate: {(total_solved / total_episodes) * 100:.2f}%")
-    print(f"  Final exploration: {metrics['exploration_percentage']:.2f}%")
-    print(f"  Time elapsed: {elapsed_time:.2f}s")
+    logger.info(f"\nTraining completed:")
+    logger.info(f"  Total steps: {current_step}")
+    logger.info(f"  Total episodes: {episode}")
+    logger.info(f"  Success rate: {success_rate:.2f}%")
+    logger.info(f"  Final exploration: {exploration_percentage:.2f}%")
+    logger.info(f"  Time elapsed: {elapsed_time:.2f}s")
     
     return agent
 
 
 def test_qmix(agent=None, maze_size=10, n_agents=2, obstacle_ratio=0.1, n_episodes=5, 
-              device="cpu", path=None, render=True, obs_type="full", pob_size=1):
+              device="cpu", path=None, render=True, obs_type="full", pob_size=1, log_dir=None):
     """
     Test QMIX agent on the maze environment.
     
@@ -1171,12 +1202,12 @@ def test_qmix(agent=None, maze_size=10, n_agents=2, obstacle_ratio=0.1, n_episod
     maze_generator = RandomBlockMazeGenerator(maze_size=maze_size, obstacle_ratio=obstacle_ratio)
     
     # Create environment with multi-agent support
-    env = MazeEnv(
+    env = EnhancedMazeEnv(
         maze_generator=maze_generator,
         pob_size=pob_size,
         action_type='VonNeumann',  # Default action type
         obs_type=obs_type,
-        live_display=render,  # Show live display during testing if render=True
+        live_display=False,  # Show live display during testing if render=True
         render_trace=True  # Track agent paths
     )
     
@@ -1268,6 +1299,14 @@ def test_qmix(agent=None, maze_size=10, n_agents=2, obstacle_ratio=0.1, n_episod
     success_count = 0
     all_metrics = []
     
+    # Initialize metric lists
+    episode_rewards = []
+    episode_steps = []
+    exploration_percentages = []
+    revisits = []
+    unique_states = []
+    steps_to_solve = []
+    
     for episode in range(1, n_episodes + 1):
         observations, info = env.reset(num_agents=n_agents)
         total_reward = 0
@@ -1283,7 +1322,8 @@ def test_qmix(agent=None, maze_size=10, n_agents=2, obstacle_ratio=0.1, n_episod
             
             # Take actions in the environment
             next_observations, rewards, dones, truncated, info = env.step(actions)
-            
+            env.render()
+
             # Get next global state
             next_global_state = get_global_state(info, maze_size, global_state_dim)
             
@@ -1313,12 +1353,6 @@ def test_qmix(agent=None, maze_size=10, n_agents=2, obstacle_ratio=0.1, n_episod
             total_reward += sum(rewards)
             steps += 1
             
-            # Print progress every 100 steps
-            if steps % 100 == 0:
-                print(f"  Episode {episode}, Step {steps}: Reward so far: {total_reward:.2f}")
-                print(f"  Exploration: {info.get('exploration_percentage', 0):.2f}% ({info.get('unique_states_visited', 0)} states)")
-                print(f"  Recent actions: {actions}")
-            
             # Check if any agent reached the goal
             if any(dones) and not any(truncated):
                 success_count += 1
@@ -1331,58 +1365,102 @@ def test_qmix(agent=None, maze_size=10, n_agents=2, obstacle_ratio=0.1, n_episod
             if steps >= 10000:
                 print(f"  Terminating episode {episode} after {steps} steps (safety limit)")
                 break
+                
+        # Try to get video, but don't fail if it's not available
+
+        if total_reward > 0:
+            env._get_video(interval=200, gif_path=os.path.join(log_dir, f"episode_{episode}.gif")).to_html5_video()
         
-        # Collect metrics for this episode
-        episode_metrics = {
-            'episode': episode,
-            'total_reward': total_reward,
-            'steps': steps,
-            'success': any(dones) and not any(truncated),
-            'total_steps': info.get('total_steps', steps),
-            'total_revisits': info.get('total_revisits', 0),
-            'unique_states_visited': info.get('unique_states_visited', 0),
-            'exploration_percentage': info.get('exploration_percentage', 0),
-            'maze_solved': info.get('maze_solved', any(dones) and not any(truncated)),
-            'steps_to_solve': info.get('steps_to_solve', steps if any(dones) and not any(truncated) else -1)
-        }
-        all_metrics.append(episode_metrics)
+        # Store metrics for this episode
+        episode_rewards.append(total_reward)
+        episode_steps.append(steps)
+        exploration_percentages.append(info.get('exploration_percentage', 0))
+        revisits.append(info.get('total_revisits', 0))
+        unique_states.append(info.get('unique_states_visited', 0))
         
-        # Log metrics
-        print(f"\nTest Episode {episode}:")
-        print(f"  Total Reward: {total_reward:.2f}")
-        print(f"  Steps: {steps}")
-        print(f"  Success: {any(dones) and not any(truncated)}")
-        print(f"  Total revisits: {info.get('total_revisits', 'N/A')}")
-        print(f"  Unique states visited: {info.get('unique_states_visited', 'N/A')}")
-        print(f"  Exploration percentage: {info.get('exploration_percentage', 'N/A'):.2f}%")
-        
-        if info.get('maze_solved', False):
-            print(f"  Maze solved in {info.get('steps_to_solve', steps)} steps")
-        
-        scores.append(total_reward)
+        if any(dones) and not any(truncated):
+            steps_to_solve.append(steps)
     
-    # Print summary statistics
-    print(f"\nTest Results after {n_episodes} episodes:")
-    print(f"  Average Reward: {np.mean(scores):.2f}")
+    # Calculate aggregate statistics
+    def calculate_stats(values):
+        if not values:
+            return 0, 0, 0
+        return max(values), np.mean(values), np.std(values)
+    
+    # Calculate statistics for each metric
+    reward_best, reward_avg, reward_std = calculate_stats(episode_rewards)
+    steps_best, steps_avg, steps_std = calculate_stats(episode_steps)
+    exp_best, exp_avg, exp_std = calculate_stats(exploration_percentages)
+    rev_best, rev_avg, rev_std = calculate_stats(revisits)
+    unique_best, unique_avg, unique_std = calculate_stats(unique_states)
+    solve_best, solve_avg, solve_std = calculate_stats(steps_to_solve)
+    
+    # Print aggregate results
+    print("\n" + "="*50)
+    print("Test Results Summary:")
     print(f"  Success Rate: {success_count/n_episodes*100:.2f}%")
+    print("\nRewards:")
+    print(f"  Best: {reward_best:.2f}")
+    print(f"  Average: {reward_avg:.2f} ± {reward_std:.2f}")
     
-    # Average metrics across all episodes
-    if all_metrics:
-        avg_steps = np.mean([m['steps'] for m in all_metrics])
-        avg_revisits = np.mean([m.get('total_revisits', 0) for m in all_metrics])
-        avg_unique_states = np.mean([m.get('unique_states_visited', 0) for m in all_metrics])
-        
-        print(f"  Average Steps: {avg_steps:.2f}")
-        print(f"  Average Revisits: {avg_revisits:.2f}")
-        print(f"  Average Unique States Visited: {avg_unique_states:.2f}")
-        
-        # Calculate average steps to solve for successful episodes only
-        successful_metrics = [m for m in all_metrics if m.get('success', False)]
-        if successful_metrics:
-            avg_steps_to_solve = np.mean([m.get('steps_to_solve', m['steps']) for m in successful_metrics])
-            print(f"  Average Steps to Solve (successful episodes): {avg_steps_to_solve:.2f}")
+    print("\nSteps:")
+    print(f"  Best: {steps_best}")
+    print(f"  Average: {steps_avg:.2f} ± {steps_std:.2f}")
     
-    return scores
+    print("\nExploration:")
+    print(f"  Best: {exp_best:.2f}%")
+    print(f"  Average: {exp_avg:.2f}% ± {exp_std:.2f}%")
+    
+    print("\nRevisits:")
+    print(f"  Best: {rev_best}")
+    print(f"  Average: {rev_avg:.2f} ± {rev_std:.2f}")
+    
+    print("\nUnique States:")
+    print(f"  Best: {unique_best}")
+    print(f"  Average: {unique_avg:.2f} ± {unique_std:.2f}")
+    
+    if steps_to_solve:
+        print("\nSteps to Solve (successful episodes only):")
+        print(f"  Best: {solve_best}")
+        print(f"  Average: {solve_avg:.2f} ± {solve_std:.2f}")
+    print("="*50)
+    
+    # Return all metrics
+    test_results = {
+        'success_rate': success_count/n_episodes*100,
+        'rewards': {
+            'best': reward_best,
+            'average': reward_avg,
+            'std': reward_std
+        },
+        'steps': {
+            'best': steps_best,
+            'average': steps_avg,
+            'std': steps_std
+        },
+        'exploration': {
+            'best': exp_best,
+            'average': exp_avg,
+            'std': exp_std
+        },
+        'revisits': {
+            'best': rev_best,
+            'average': rev_avg,
+            'std': rev_std
+        },
+        'unique_states': {
+            'best': unique_best,
+            'average': unique_avg,
+            'std': unique_std
+        },
+        'steps_to_solve': {
+            'best': solve_best,
+            'average': solve_avg,
+            'std': solve_std
+        } if steps_to_solve else None
+    }
+    
+    return test_results
 
 
 if __name__ == "__main__":
@@ -1428,9 +1506,9 @@ if __name__ == "__main__":
                         help="Learning rate for optimizer")
     parser.add_argument("--gamma", type=float, default=0.99,
                         help="Discount factor")
-    parser.add_argument("--agent_update_frequency", type=int, default=1,
+    parser.add_argument("--agent_update_frequency", type=int, default=1000,
                         help="How often to update agent networks")
-    parser.add_argument("--target_update_frequency", type=int, default=100,
+    parser.add_argument("--target_update_frequency", type=int, default=1000,
                         help="How often to update target network")
     parser.add_argument("--tau", type=float, default=1.0,
                         help="Interpolation parameter for target network update")
@@ -1481,6 +1559,7 @@ if __name__ == "__main__":
             num_agents=args.num_agents,
             memory_size=args.memory_size,
             learning_rate=args.learning_rate,
+            learning_starts=args.learning_starts,
             training_steps=args.training_steps,
             batch_size=args.batch_size,
             gamma=args.gamma,
@@ -1493,7 +1572,11 @@ if __name__ == "__main__":
             exploration_percentage_threshold=args.exploration_threshold,
             log_every=args.log_every,
             seed=args.seed,
-            experiment_name=args.experiment_name
+            experiment_name=args.experiment_name,
+            obs_type=args.obs_type,
+            pob_size=args.pob_size,
+            obstacle_ratio=args.obstacle_ratio,
+            log_dir=args.log_dir
         )
     
     # Test QMIX agent if specified
@@ -1510,5 +1593,6 @@ if __name__ == "__main__":
             path=args.model_path,  # This will be used only if agent is None
             render=args.render,
             obs_type=args.obs_type,
-            pob_size=args.pob_size
+            pob_size=args.pob_size,
+            log_dir=args.log_dir
         )
