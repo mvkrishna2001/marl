@@ -1,6 +1,7 @@
 ## Top-level comments
-- `qmix.py` is the MARL algorithm we implemented.
-- More details regarding the results can be found in [these slides](https://docs.google.com/presentation/d/1as4J6RhhmO1J0AUniK_rIjEl3sd3wa7g/edit?usp=sharing&ouid=109685225193745201596&rtpof=true&sd=true)
+- `qmix.py` has the MARL algorithm we implemented.
+- More details regarding the results can be found in [these slides](https://docs.google.com/presentation/d/1as4J6RhhmO1J0AUniK_rIjEl3sd3wa7g/edit?usp=sharing&ouid=109685225193745201596&rtpof=true&sd=true).
+- `RobotLearningProjectReport.pdf` is an extensive report walking through the algorithm and the results in greater detail.
 
 ## Installation
 
